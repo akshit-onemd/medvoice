@@ -1,0 +1,180 @@
+{
+    "allergies": [
+        {
+            "name": "",
+            "snomed_ct_code": "",
+            "snomed_ct_term": "",
+            "icd10_code": "",
+            "notes": ""
+        }
+    ],
+    "vitals": [
+        {
+            "name": "Systolic Blood Pressure",
+            "value": "",
+            "units": "mmHg",
+            "loinc_code": "8480-6"
+        },
+        {
+            "name": "Diastolic Blood Pressure",
+            "value": "",
+            "units": "mmHg",
+            "loinc_code": "8462-4"
+        },
+        {
+            "name": "Body Temperature",
+            "value": "",
+            "units": "\u00b0F",
+            "loinc_code": "8310-5"
+        },
+        {
+            "name": "Respiration",
+            "value": "",
+            "units": "per min",
+            "loinc_code": "9279-1"
+        },
+        {
+            "name": "Body Weight",
+            "value": "",
+            "units": "kgs",
+            "loinc_code": "29463-7"
+        },
+        {
+            "name": "Body Height",
+            "value": "",
+            "units": "ft",
+            "loinc_code": "8302-2"
+        }
+    ],
+    "conditions": [
+        {
+            "name": "",
+            "snomed_ct_code": "",
+            "snomed_ct_term": "",
+            "icd10_code": "",
+            "duration": "",
+            "start_date": "",
+            "end_date": "",
+            "notes": ""
+        }
+    ],
+    "system_review": [
+        {
+            "name": "",
+            "findings": [
+                {
+                    "finding": "",
+                    "snomed_ct_code": ""
+                }
+            ],
+            "notes": ""
+        }
+    ],
+    "family_history": [
+        {
+            "relationship": "",
+            "illness": [],
+            "snomed_ct_codes": [],
+            "icd10_codes": [],
+            "notes": ""
+        }
+    ],
+    "medication_history": [
+        {
+            "name": "",
+            "rxnorm_code": "",
+            "dosage": "",
+            "duration": "",
+            "start_date": "",
+            "end_date": "",
+            "status": "",
+            "instruction": []
+        }
+    ],
+    "investigation_history": [
+        {
+            "name": "",
+            "date": "",
+            "readings": [
+                {
+                    "investigation_name": "",
+                    "loinc_code": "",
+                    "result": "",
+                    "unit": "",
+                    "interpretation": "",
+                    "interpretation_snomed_code": "",
+                    "notes": ""
+                }
+            ]
+        }
+    ],
+    "procedures": [
+        {
+            "name": "",
+            "snomed_ct_code": "",
+            "icd10_pcs_code": "",
+            "date": "",
+            "notes": ""
+        }
+    ],
+    "lifestyle_habits": [
+        {
+            "name": "",
+            "snomed_ct_code": "",
+            "duration": "",
+            "start_date": "",
+            "end_date": "",
+            "frequency": "",
+            "notes": ""
+        }
+    ],
+    "social_history": [
+        {
+            "name": "",
+            "snomed_ct_code": "",
+            "notes": ""
+        }
+    ],
+    "other_history": [
+        {
+            "name": "",
+            "notes": ""
+        }
+    ],
+    "prescription": {
+        "symptoms": [
+            {
+                "name": "",
+                "snomed_ct_code": "",
+                "duration": "",
+                "start_date": "",
+                "end_date": "",
+                "notes": ""
+            }
+        ],
+        "medications": [
+            {
+                "name": "",
+                "rxnorm_code": "",
+                "duration": "",
+                "dosage": [],
+                "instructions": ""
+            }
+        ],
+        "diagnosis": [
+            {
+                "name": "",
+                "snomed_ct_code": "",
+                "snomed_ct_term": "",
+                "icd10_code": ""
+            }
+        ],
+        "followup": [
+            {
+                "next_visit_duration": "",
+                "date": "",
+                "advice": ""
+            }
+        ]
+    }
+}
