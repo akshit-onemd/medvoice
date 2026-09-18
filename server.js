@@ -4,6 +4,7 @@ const axios = require("axios");
 const fs = require("fs");
 const { pdf } = require("pdf-to-img");
 const app = express();
+const path = require("path");
 require("dotenv").config();
 const FormData = require("form-data");
 if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
@@ -278,6 +279,106 @@ async function transcribeWithGroq(filePath, originalName, mimetype) {
         language: response.data.language || "unknown",
     };
 }
+const { SarvamAIClient } = require("sarvamai");
+const sarvamClient = new SarvamAIClient({
+    apiSubscriptionKey: process.env.SARVAM_API_KEY,
+});
+const { ElevenLabsClient } = require("@elevenlabs/elevenlabs-js");
+const elevenlabsClient = new ElevenLabsClient({
+    apiKey: process.env.ELEVENLABS_API_KEY,
+});
+async function transcribeWithSarvam(filePath) {
+    console.log("📤 Creating Sarvam batch job...");
+    const job = await sarvamClient.speechToTextJob.createJob({
+        model: "saaras:v4",
+        mode: "transcribe",
+    });
+
+    console.log("🆔 Sarvam job ID:", job.jobId || job.job_id);
+
+    console.log("📤 Uploading audio to Sarvam...");
+    await job.uploadFiles([filePath]);
+
+    console.log("▶️ Starting job...");
+    await job.start();
+
+    console.log("⏳ Waiting for Sarvam to finish...");
+    await job.waitUntilComplete();
+
+    console.log("📋 Checking file results...");
+    const fileResults = await job.getFileResults();
+
+    if (fileResults.successful.length === 0) {
+        const failure = fileResults.failed[0];
+        throw new Error(
+            `Sarvam transcription failed: ${failure?.error_message || "unknown error"}`,
+        );
+    }
+
+    const jobId = job.jobId || job.job_id;
+    const outputDir = path.join("sarvam-outputs", jobId);
+    fs.mkdirSync(outputDir, { recursive: true });
+
+    console.log("📥 Downloading outputs...");
+    await job.downloadOutputs(outputDir);
+
+    const outputFiles = fs
+        .readdirSync(outputDir)
+        .filter((f) => f.endsWith(".json"));
+    if (outputFiles.length === 0) {
+        throw new Error("Sarvam downloadOutputs() produced no output files");
+    }
+
+    const result = JSON.parse(
+        fs.readFileSync(path.join(outputDir, outputFiles[0]), "utf-8"),
+    );
+    console.log("Sarvam result:", result);
+
+    fs.rm(outputDir, { recursive: true, force: true }, () => {});
+
+    return {
+        transcript: result.transcript || "",
+        language: result.language_code || "unknown",
+    };
+}
+function buildDiarizedTranscript(words) {
+    if (!Array.isArray(words) || words.length === 0) return "";
+
+    const turns = [];
+    let current = null;
+
+    for (const w of words) {
+        if (w.type === "spacing") continue; // skip whitespace tokens
+
+        const speaker = w.speakerId || "unknown";
+        if (!current || current.speaker !== speaker) {
+            current = { speaker, text: "" };
+            turns.push(current);
+        }
+        current.text += (current.text ? " " : "") + w.text;
+    }
+
+    return turns.map((t) => `${t.speaker}: ${t.text}`).join("\n");
+}
+async function transcribeWithElevenLabs(filePath, originalName, mimetype) {
+    const fileBuffer = fs.readFileSync(filePath);
+    const audioBlob = new Blob([fileBuffer], {
+        type: mimetype || "audio/mpeg",
+    });
+
+    const result = await elevenlabsClient.speechToText.convert({
+        file: audioBlob,
+        modelId: "scribe_v2_medical",
+        diarize: true,
+    });
+
+    return {
+        transcript: result.text || "",
+        language: result.languageCode || "unknown",
+        diarizedTranscript: buildDiarizedTranscript(result.words),
+        words: result.words || [],
+    };
+}
 app.post(
     "/process-audio",
     upload.fields([
@@ -323,15 +424,26 @@ app.post(
                 ? parseInt(req.body.patient_age, 10)
                 : null;
             const patientGender = req.body.patient_gender || null;
-
+            const sttProvider = (
+                req.body.stt_provider || "whisper"
+            ).toLowerCase();
             if (!patientId && (!patientName || !patientPhone)) {
                 return res.status(400).json({
                     error: "Select an existing patient, or provide a name and phone number for a new one",
                 });
             }
-            async function runPipeline(transcript, language) {
+            async function runPipeline(
+                transcript,
+                language,
+                diarizedTranscript,
+            ) {
                 console.log("\n📝 Transcript:");
                 console.log(transcript);
+
+                if (diarizedTranscript) {
+                    console.log("\n🗣️ Diarized Transcript:");
+                    console.log(diarizedTranscript);
+                }
 
                 console.log("\n📄 Loading template.json...");
                 const template = fs.readFileSync("template.json", "utf-8");
@@ -533,23 +645,39 @@ app.post(
             }
 
             if (audioFile) {
-                console.log("\n🎙️ Transcribing via Groq Whisper...");
+                const providerLabels = {
+                    sarvam: "Sarvam",
+                    elevenlabs: "ElevenLabs Scribe",
+                    whisper: "Groq Whisper",
+                };
+                const providerLabel =
+                    providerLabels[sttProvider] || "Groq Whisper";
+                console.log(`\n🎙️ Transcribing via ${providerLabel}...`);
                 try {
-                    const { transcript, language } = await transcribeWithGroq(
-                        audioFile.path,
-                        audioFile.originalname,
-                        audioFile.mimetype,
-                    );
-                    await runPipeline(transcript, language);
+                    const transcribeFns = {
+                        sarvam: transcribeWithSarvam,
+                        elevenlabs: transcribeWithElevenLabs,
+                    };
+                    const transcribeFn =
+                        transcribeFns[sttProvider] || transcribeWithGroq;
+                    const { transcript, language, diarizedTranscript } =
+                        await transcribeFn(
+                            audioFile.path,
+                            audioFile.originalname,
+                            audioFile.mimetype,
+                        );
+                    await runPipeline(transcript, language, diarizedTranscript);
                 } catch (err) {
                     console.log(
-                        "❌ Groq transcription failed:",
+                        `❌ ${providerLabel} transcription failed:`,
                         err.response?.data || err.message,
                     );
                     return res.status(500).json({
                         error: "Transcription failed",
                         details:
-                            err.response?.data?.error?.message || err.message,
+                            err.response?.data?.error?.message ||
+                            err.response?.data?.message ||
+                            err.message,
                     });
                 } finally {
                     fs.unlink(audioFile.path, () => {});
@@ -584,6 +712,62 @@ app.get("/patients/search", async (req, res) => {
     } catch (err) {
         console.log("⚠️ Patient search failed:", err.message);
         res.status(500).json({ error: "Search failed" });
+    }
+});
+app.get("/patients/:id/consultations", async (req, res) => {
+    const { id } = req.params;
+    try {
+        const { data, error } = await supabase
+            .from("consultations")
+            .select("id, created_at, language, structured_data")
+            .eq("patient_id", id)
+            .order("created_at", { ascending: false });
+
+        if (error) throw error;
+
+        const consultations = data.map((c) => ({
+            id: c.id,
+            created_at: c.created_at,
+            language: c.language,
+            // best-effort one-line summary for the list — adjust fields to match your template.json shape
+            summary:
+                c.structured_data?.conditions?.[0]?.name ||
+                c.structured_data?.chief_complaint ||
+                null,
+        }));
+
+        res.json({ consultations });
+    } catch (err) {
+        console.log("⚠️ Fetching consultations failed:", err.message);
+        res.status(500).json({ error: "Failed to fetch consultations" });
+    }
+});
+
+app.get("/consultations/:id", async (req, res) => {
+    const { id } = req.params;
+    try {
+        const { data, error } = await supabase
+            .from("consultations")
+            .select("*, patients(id, name)")
+            .eq("id", id)
+            .single();
+
+        if (error) throw error;
+
+        res.json({
+            language: data.language,
+            transcript: data.transcript,
+            diarizedTranscript: data.diarized_transcript,
+            structured_data: data.structured_data,
+            saved: {
+                patient_id: data.patients?.id,
+                patient_name: data.patients?.name,
+                consultation_id: data.id,
+            },
+        });
+    } catch (err) {
+        console.log("⚠️ Fetching consultation failed:", err.message);
+        res.status(500).json({ error: "Failed to fetch consultation" });
     }
 });
 const PORT = process.env.PORT || 8000;
