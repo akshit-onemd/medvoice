@@ -216,7 +216,8 @@ async function verifyFindings(findings) {
 }
 async function verifyAllCodes(data) {
     for (const [sectionName, section] of Object.entries(data)) {
-        if (sectionName === "vitals") continue;
+        if (sectionName === "vitals" || sectionName === "consultation_summary")
+            continue;
 
         if (sectionName === "family_history") {
             for (const entry of section) {
@@ -378,6 +379,81 @@ async function transcribeWithElevenLabs(filePath, originalName, mimetype) {
         diarizedTranscript: buildDiarizedTranscript(result.words),
         words: result.words || [],
     };
+}
+async function regeneratePatientSummary(patientId) {
+    const { data, error } = await supabase
+        .from("consultations")
+        .select("created_at, structured_data")
+        .eq("patient_id", patientId)
+        .order("created_at", { ascending: true });
+    if (error) throw error;
+
+    const summaries = data
+        .map((c) => ({
+            date: c.created_at,
+            summary: c.structured_data?.consultation_summary?.details,
+        }))
+        .filter((s) => Array.isArray(s.summary) && s.summary.length > 0);
+    let patientSummary = { overview: "", details: [] };
+
+    if (summaries.length > 0) {
+        const formatted = summaries
+            .map(
+                (s) =>
+                    `[${new Date(s.date).toISOString().slice(0, 10)}]\n${s.summary
+                        .map((l) => `- ${l}`)
+                        .join("\n")}`,
+            )
+            .join("\n\n");
+
+        let prompt = fs.readFileSync("patient-summary-prompt.md", "utf-8");
+        prompt = prompt.replace("{{consultation_summaries}}", formatted);
+
+        try {
+            const ollamaResponse = await axios.post(
+                "https://ollama.com/api/generate",
+                { model: "gemma4:31b-cloud", prompt, stream: false },
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
+                    },
+                },
+            );
+            let rawResponse = ollamaResponse.data.response.trim();
+            rawResponse = rawResponse
+                .replace(/```json/g, "")
+                .replace(/```/g, "")
+                .trim();
+            const parsed = JSON.parse(rawResponse);
+            patientSummary = {
+                overview:
+                    typeof parsed.overview === "string" ? parsed.overview : "",
+                details: Array.isArray(parsed.details)
+                    ? parsed.details
+                    : summaries[summaries.length - 1].summary, // fallback: most recent visit's shorthand
+            };
+        } catch (err) {
+            console.log(
+                "⚠️ Patient summary LLM call failed, using latest visit:",
+                err.message,
+            );
+            patientSummary = {
+                overview: "", // no plain-language line available without the LLM
+                details: summaries[summaries.length - 1].summary,
+            };
+        }
+    }
+
+    const { error: updateError } = await supabase
+        .from("patients")
+        .update({
+            patient_summary: patientSummary,
+            patient_summary_updated_at: new Date().toISOString(),
+        })
+        .eq("id", patientId);
+    if (updateError) throw updateError;
+
+    return patientSummary;
 }
 app.post(
     "/process-audio",
@@ -603,6 +679,8 @@ app.post(
                                     patient_id: patient.id,
                                     language,
                                     transcript,
+                                    diarized_transcript:
+                                        diarizedTranscript || null,
                                     structured_data: structuredData,
                                 })
                                 .select()
@@ -615,6 +693,13 @@ app.post(
                                 consultation_id: consultation.id,
                             };
                             console.log("✅ Saved:", savedRecord);
+
+                            regeneratePatientSummary(patient.id).catch((err) =>
+                                console.log(
+                                    "⚠️ Patient summary regeneration failed:",
+                                    err.message,
+                                ),
+                            );
                         } catch (err) {
                             console.log(
                                 "⚠️ Consultation save failed:",
@@ -626,6 +711,7 @@ app.post(
                     res.json({
                         language,
                         transcript,
+                        diarizedTranscript: diarizedTranscript || null,
                         structured_data: structuredData,
                         saved: savedRecord,
                     });
@@ -730,10 +816,7 @@ app.get("/patients/:id/consultations", async (req, res) => {
             created_at: c.created_at,
             language: c.language,
             // best-effort one-line summary for the list — adjust fields to match your template.json shape
-            summary:
-                c.structured_data?.conditions?.[0]?.name ||
-                c.structured_data?.chief_complaint ||
-                null,
+            summary: c.structured_data?.conditions?.[0]?.name || null,
         }));
 
         res.json({ consultations });
@@ -768,6 +851,29 @@ app.get("/consultations/:id", async (req, res) => {
     } catch (err) {
         console.log("⚠️ Fetching consultation failed:", err.message);
         res.status(500).json({ error: "Failed to fetch consultation" });
+    }
+});
+app.get("/patients/:id/summary", async (req, res) => {
+    const { id } = req.params;
+    try {
+        const { data: patient, error } = await supabase
+            .from("patients")
+            .select("patient_summary, patient_summary_updated_at")
+            .eq("id", id)
+            .single();
+        if (error) throw error;
+
+        if (patient.patient_summary !== null) {
+            return res.json({ patient_summary: patient.patient_summary });
+        }
+
+        // No cache yet (e.g. patient existed before this feature, or first-ever visit
+        // hasn't triggered a regenerate for some reason) — compute once, then cached from here on.
+        const patientSummary = await regeneratePatientSummary(id);
+        res.json({ patient_summary: patientSummary });
+    } catch (err) {
+        console.log("⚠️ Patient summary fetch failed:", err.message);
+        res.status(500).json({ error: "Failed to load patient summary" });
     }
 });
 const PORT = process.env.PORT || 8000;
