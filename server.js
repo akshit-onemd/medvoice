@@ -8,11 +8,30 @@ const path = require("path");
 require("dotenv").config();
 const FormData = require("form-data");
 if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
+const { clerkMiddleware, getAuth } = require("@clerk/express");
+
+// CORS (must allow Authorization + handle preflight)
 app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Headers", "*");
+    res.header("Access-Control-Allow-Origin", "*"); // ideally your frontend URL
+    res.header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
 });
+
+// Attach Clerk session info to every request
+app.use(clerkMiddleware());
+
+// Reject anything without a valid signed-in user
+app.use((req, res, next) => {
+    const { userId } = getAuth(req);
+    if (!userId) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+    req.userId = userId;
+    next();
+});
+app.use(express.json({ limit: "1mb" }));
 const { createClient } = require("@supabase/supabase-js");
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -620,21 +639,25 @@ app.post(
                     let patient = null;
                     try {
                         if (patientId) {
+                            // existing patient: must belong to this user
                             const { data, error } = await supabase
                                 .from("patients")
                                 .select()
                                 .eq("id", patientId)
+                                .eq("owner_id", req.userId)
                                 .single();
                             if (error) throw error;
                             patient = data;
                         } else {
                             const { data, error } = await supabase
                                 .from("patients")
+                                // new patient: stamp the owner
                                 .insert({
                                     name: patientName,
                                     age: patientAge,
                                     gender: patientGender,
                                     phone: patientPhone,
+                                    owner_id: req.userId,
                                 })
                                 .select()
                                 .single();
@@ -648,8 +671,10 @@ app.post(
                                     const { data: existing, error: fetchErr } =
                                         await supabase
                                             .from("patients")
+                                            // duplicate-phone fallback: look up within this user's patients only
                                             .select()
                                             .eq("phone", patientPhone)
+                                            .eq("owner_id", req.userId)
                                             .single();
                                     if (fetchErr) throw fetchErr;
                                     patient = existing;
@@ -668,6 +693,7 @@ app.post(
                     }
 
                     let savedRecord = null;
+                    let createdAt = null;
                     if (patient) {
                         try {
                             const {
@@ -675,8 +701,10 @@ app.post(
                                 error: consultationError,
                             } = await supabase
                                 .from("consultations")
+                                // consultation insert
                                 .insert({
                                     patient_id: patient.id,
+                                    owner_id: req.userId,
                                     language,
                                     transcript,
                                     diarized_transcript:
@@ -686,10 +714,14 @@ app.post(
                                 .select()
                                 .single();
                             if (consultationError) throw consultationError;
+                            createdAt = consultation.created_at;
 
                             savedRecord = {
                                 patient_id: patient.id,
                                 patient_name: patient.name,
+                                patient_age: patient.age,
+                                patient_gender: patient.gender,
+                                patient_phone: patient.phone,
                                 consultation_id: consultation.id,
                             };
                             console.log("✅ Saved:", savedRecord);
@@ -713,10 +745,13 @@ app.post(
                         transcript,
                         diarizedTranscript: diarizedTranscript || null,
                         structured_data: structuredData,
+                        created_at: createdAt,
                         saved: savedRecord,
                     });
                 } catch (ollamaError) {
-                    console.log("\n❌ OLLAMA ERROR");
+                    console.log(
+                        "\n❌ PIPELINE ERROR (Ollama call or post-processing)",
+                    );
                     if (ollamaError.response) {
                         console.log("Status:", ollamaError.response.status);
                         console.log("Response:", ollamaError.response.data);
@@ -790,9 +825,9 @@ app.get("/patients/search", async (req, res) => {
         const { data, error } = await supabase
             .from("patients")
             .select("id, name, age, gender, phone")
+            .eq("owner_id", req.userId)
             .or(`name.ilike.%${query}%,phone.ilike.%${query}%`)
             .limit(10);
-
         if (error) throw error;
         res.json({ patients: data });
     } catch (err) {
@@ -807,8 +842,8 @@ app.get("/patients/:id/consultations", async (req, res) => {
             .from("consultations")
             .select("id, created_at, language, structured_data")
             .eq("patient_id", id)
+            .eq("owner_id", req.userId)
             .order("created_at", { ascending: false });
-
         if (error) throw error;
 
         const consultations = data.map((c) => ({
@@ -831,20 +866,25 @@ app.get("/consultations/:id", async (req, res) => {
     try {
         const { data, error } = await supabase
             .from("consultations")
-            .select("*, patients(id, name)")
+            .select("*, patients(id, name, age, gender, phone)")
             .eq("id", id)
-            .single();
-
+            .eq("owner_id", req.userId)
+            .maybeSingle();
         if (error) throw error;
+        if (!data) return res.status(404).json({ error: "Not found" });
 
         res.json({
             language: data.language,
             transcript: data.transcript,
             diarizedTranscript: data.diarized_transcript,
             structured_data: data.structured_data,
+            created_at: data.created_at,
             saved: {
                 patient_id: data.patients?.id,
                 patient_name: data.patients?.name,
+                patient_age: data.patients?.age,
+                patient_gender: data.patients?.gender,
+                patient_phone: data.patients?.phone,
                 consultation_id: data.id,
             },
         });
@@ -860,9 +900,10 @@ app.get("/patients/:id/summary", async (req, res) => {
             .from("patients")
             .select("patient_summary, patient_summary_updated_at")
             .eq("id", id)
-            .single();
+            .eq("owner_id", req.userId)
+            .maybeSingle();
         if (error) throw error;
-
+        if (!patient) return res.status(404).json({ error: "Not found" });
         if (patient.patient_summary !== null) {
             return res.json({ patient_summary: patient.patient_summary });
         }
@@ -874,6 +915,67 @@ app.get("/patients/:id/summary", async (req, res) => {
     } catch (err) {
         console.log("⚠️ Patient summary fetch failed:", err.message);
         res.status(500).json({ error: "Failed to load patient summary" });
+    }
+});
+app.get("/doctor/profile", async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from("doctors")
+            .select("*")
+            .eq("owner_id", req.userId)
+            .maybeSingle();
+        if (error) throw error;
+        res.json({ profile: data || null });
+    } catch (err) {
+        console.log("⚠️ Profile fetch failed:", err.message);
+        res.status(500).json({ error: "Failed to load profile" });
+    }
+});
+
+app.put("/doctor/profile", async (req, res) => {
+    try {
+        const b = req.body || {};
+        const name = typeof b.name === "string" ? b.name.trim() : "";
+        const sig = b.signature_data;
+
+        if (!name) return res.status(400).json({ error: "Name is required" });
+        if (typeof sig !== "string" || sig.length > 500000) {
+            return res
+                .status(400)
+                .json({ error: "A valid signature is required" });
+        }
+        if (!/^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(sig)) {
+            return res
+                .status(400)
+                .json({ error: "Signature must be a PNG or JPEG image" });
+        }
+
+        const clean = (v, max = 200) =>
+            (typeof v === "string" ? v.trim().slice(0, max) : "") || null;
+
+        const { data, error } = await supabase
+            .from("doctors")
+            .upsert(
+                {
+                    owner_id: req.userId,
+                    name: name.slice(0, 120),
+                    qualification: clean(b.qualification),
+                    registration_no: clean(b.registration_no, 60),
+                    email: clean(b.email),
+                    clinic_name: clean(b.clinic_name),
+                    clinic_address: clean(b.clinic_address, 300),
+                    signature_data: sig,
+                    updated_at: new Date().toISOString(),
+                },
+                { onConflict: "owner_id" },
+            )
+            .select()
+            .single();
+        if (error) throw error;
+        res.json({ profile: data });
+    } catch (err) {
+        console.log("⚠️ Profile save failed:", err.message);
+        res.status(500).json({ error: "Failed to save profile" });
     }
 });
 const PORT = process.env.PORT || 8000;
