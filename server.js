@@ -978,6 +978,114 @@ app.put("/doctor/profile", async (req, res) => {
         res.status(500).json({ error: "Failed to save profile" });
     }
 });
+const RX_FIELDS = {
+    symptoms: ["name", "duration", "start_date", "end_date", "notes"],
+    medications: ["name", "duration", "instructions"], // dosage handled separately (array)
+    diagnosis: ["name"],
+    followup: ["next_visit_duration", "date", "advice"],
+};
+const BLANK_CODES = {
+    symptoms: { snomed_ct_code: "" },
+    medications: { rxnorm_code: "" },
+    diagnosis: { snomed_ct_code: "", snomed_ct_term: "", icd10_code: "" },
+    followup: {},
+};
+const CODE_KEY = /code|_verified|_corrected|umls_term|snomed_ct_term/;
+const str = (v, max = 300) =>
+    typeof v === "string" ? v.trim().slice(0, max) : "";
+
+// Rebuild each entry from a whitelist. Existing codes are kept when the name is
+// unchanged; new or renamed entries get fresh codes looked up via UMLS.
+async function sanitizeRxList(key, incoming, existing) {
+    if (!Array.isArray(incoming)) return [];
+    const out = [];
+    for (const raw of incoming.slice(0, 30)) {
+        if (!raw || typeof raw !== "object") continue;
+        const entry = {};
+        for (const f of RX_FIELDS[key]) entry[f] = str(raw[f]);
+        if (key === "medications") {
+            entry.dosage = (Array.isArray(raw.dosage) ? raw.dosage : [])
+                .map((d) => str(d, 60))
+                .filter(Boolean)
+                .slice(0, 10);
+        }
+        const hasContent = Object.values(entry).some((v) =>
+            Array.isArray(v) ? v.length > 0 : v,
+        );
+        if (!hasContent) continue;
+
+        if (key !== "followup") {
+            if (!entry.name) continue; // a row without a name is dropped
+            const prev = existing.find(
+                (e) => str(e?.name).toLowerCase() === entry.name.toLowerCase(),
+            );
+            if (prev) {
+                for (const k of Object.keys(prev)) {
+                    if (CODE_KEY.test(k)) entry[k] = prev[k];
+                }
+            } else {
+                Object.assign(entry, BLANK_CODES[key]);
+                try {
+                    await verifyEntry(entry);
+                } catch (err) {
+                    console.log(
+                        "⚠️ Code lookup failed for edited entry:",
+                        err.message,
+                    );
+                }
+            }
+        }
+        out.push(entry);
+    }
+    return out;
+}
+
+app.put("/consultations/:id/prescription", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const incoming = req.body?.prescription;
+        if (!incoming || typeof incoming !== "object") {
+            return res.status(400).json({ error: "Invalid prescription data" });
+        }
+
+        const { data: row, error } = await supabase
+            .from("consultations")
+            .select("structured_data")
+            .eq("id", id)
+            .eq("owner_id", req.userId)
+            .maybeSingle();
+        if (error) throw error;
+        if (!row) return res.status(404).json({ error: "Not found" });
+
+        const sd =
+            row.structured_data && typeof row.structured_data === "object"
+                ? row.structured_data
+                : {};
+        const existingRx = sd.prescription || {};
+
+        const cleaned = {};
+        for (const key of Object.keys(RX_FIELDS)) {
+            cleaned[key] = await sanitizeRxList(
+                key,
+                incoming[key],
+                Array.isArray(existingRx[key]) ? existingRx[key] : [],
+            );
+        }
+        const prescription = { ...existingRx, ...cleaned };
+
+        const { error: updateError } = await supabase
+            .from("consultations")
+            .update({ structured_data: { ...sd, prescription } })
+            .eq("id", id)
+            .eq("owner_id", req.userId);
+        if (updateError) throw updateError;
+
+        res.json({ prescription });
+    } catch (err) {
+        console.log("⚠️ Prescription update failed:", err.message);
+        res.status(500).json({ error: "Failed to save changes" });
+    }
+});
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
