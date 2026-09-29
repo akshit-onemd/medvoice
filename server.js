@@ -474,6 +474,171 @@ async function regeneratePatientSummary(patientId) {
 
     return patientSummary;
 }
+function summarizeSectionForPrompt(sd) {
+    const lines = [];
+    const push = (label, text) => text && lines.push(`${label}: ${text}`);
+    const j = (arr, f) =>
+        Array.isArray(arr)
+            ? arr
+                  .map((e) => f(e))
+                  .filter(Boolean)
+                  .join("; ")
+            : "";
+
+    push(
+        "Symptoms",
+        j(sd.prescription?.symptoms, (e) => e.name),
+    );
+    push(
+        "Vitals",
+        j(sd.vitals, (v) =>
+            v.value ? `${v.name} ${v.value}${v.units || ""}` : "",
+        ),
+    );
+    push(
+        "Allergies",
+        j(sd.allergies, (e) => e.name),
+    );
+    push(
+        "Conditions",
+        j(sd.conditions, (e) => e.name),
+    );
+    push(
+        "Medication history",
+        j(
+            sd.medication_history,
+            (e) => `${e.name} ${e.dosage || ""} (${e.status || ""})`,
+        ),
+    );
+    push(
+        "Investigations",
+        j(
+            sd.investigation_history,
+            (i) =>
+                `${i.name}: ${j(i.readings, (r) => `${r.investigation_name} ${r.result || ""}${r.unit || ""} (${r.interpretation || ""})`)}`,
+        ),
+    );
+    push(
+        "Procedures",
+        j(sd.procedures, (e) => `${e.name} (${e.date || ""})`),
+    );
+    push(
+        "System review",
+        j(
+            sd.system_review,
+            (e) => `${e.name}: ${j(e.findings, (f) => f.finding)}`,
+        ),
+    );
+    push(
+        "Family history",
+        j(
+            sd.family_history,
+            (e) => `${e.relationship}: ${(e.illness || []).join(", ")}`,
+        ),
+    );
+    push(
+        "Lifestyle",
+        j(sd.lifestyle_habits, (e) => e.name),
+    );
+    push(
+        "Social history",
+        j(sd.social_history, (e) => e.name),
+    );
+    push(
+        "Other history",
+        j(sd.other_history, (e) => e.name),
+    );
+    push(
+        "Diagnosis",
+        j(sd.prescription?.diagnosis, (e) => e.name),
+    );
+    push(
+        "Medications prescribed",
+        j(
+            sd.prescription?.medications,
+            (e) =>
+                `${e.name} ${(e.dosage || []).join("-")} (${e.duration || ""})`,
+        ),
+    );
+    push(
+        "Follow up",
+        j(
+            sd.prescription?.followup,
+            (e) =>
+                `${e.next_visit_duration || e.date || ""}: ${e.advice || ""}`,
+        ),
+    );
+
+    return lines.join("\n");
+}
+
+async function regenerateConsultationSummary(structuredData) {
+    const record = summarizeSectionForPrompt(structuredData);
+    if (!record.trim())
+        return (
+            structuredData.consultation_summary || { overview: "", details: [] }
+        );
+
+    let prompt = fs.readFileSync(
+        "consultation-summary-refresh-prompt.md",
+        "utf-8",
+    );
+    prompt = prompt.replace("{{record}}", record);
+
+    try {
+        const ollamaResponse = await axios.post(
+            "https://ollama.com/api/generate",
+            { model: "gemma4:31b-cloud", prompt, stream: false },
+            {
+                headers: {
+                    Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
+                },
+            },
+        );
+        let raw = ollamaResponse.data.response
+            .trim()
+            .replace(/```json/g, "")
+            .replace(/```/g, "")
+            .trim();
+        const parsed = JSON.parse(raw);
+        return {
+            overview:
+                typeof parsed.overview === "string" ? parsed.overview : "",
+            details: Array.isArray(parsed.details) ? parsed.details : [],
+        };
+    } catch (err) {
+        console.log(
+            "⚠️ Consultation summary regeneration failed, keeping previous summary:",
+            err.message,
+        );
+        return (
+            structuredData.consultation_summary || { overview: "", details: [] }
+        );
+    }
+}
+async function afterConsultationEdit(consultationId, sd) {
+    const summary = await regenerateConsultationSummary(sd);
+    const updated = { ...sd, consultation_summary: summary };
+
+    const { error } = await supabase
+        .from("consultations")
+        .update({ structured_data: updated })
+        .eq("id", consultationId);
+    if (error) throw error;
+
+    const { data: row } = await supabase
+        .from("consultations")
+        .select("patient_id")
+        .eq("id", consultationId)
+        .maybeSingle();
+    if (row?.patient_id) {
+        regeneratePatientSummary(row.patient_id).catch((err) =>
+            console.log("⚠️ Patient summary regeneration failed:", err.message),
+        );
+    }
+
+    return updated;
+}
 app.post(
     "/process-audio",
     upload.fields([
@@ -1072,17 +1237,327 @@ app.put("/consultations/:id/prescription", async (req, res) => {
             );
         }
         const prescription = { ...existingRx, ...cleaned };
+        const updated = await afterConsultationEdit(id, {
+            ...sd,
+            prescription,
+        });
 
-        const { error: updateError } = await supabase
-            .from("consultations")
-            .update({ structured_data: { ...sd, prescription } })
-            .eq("id", id)
-            .eq("owner_id", req.userId);
-        if (updateError) throw updateError;
-
-        res.json({ prescription });
+        res.json({
+            prescription: updated.prescription,
+            consultation_summary: updated.consultation_summary,
+        });
     } catch (err) {
         console.log("⚠️ Prescription update failed:", err.message);
+        res.status(500).json({ error: "Failed to save changes" });
+    }
+});
+const SIMPLE_SECTIONS = {
+    allergies: {
+        fields: ["name", "notes"],
+        codeFields: ["snomed_ct_code", "icd10_code"],
+    },
+    conditions: {
+        fields: ["name", "duration", "start_date", "end_date", "notes"],
+        codeFields: ["snomed_ct_code", "icd10_code"],
+    },
+    procedures: {
+        fields: ["name", "date", "notes"],
+        codeFields: ["snomed_ct_code", "icd10_pcs_code"],
+    },
+    lifestyle_habits: {
+        fields: [
+            "name",
+            "frequency",
+            "duration",
+            "start_date",
+            "end_date",
+            "notes",
+        ],
+        codeFields: ["snomed_ct_code"],
+    },
+    social_history: {
+        fields: ["name", "notes"],
+        codeFields: ["snomed_ct_code"],
+    },
+    other_history: { fields: ["name", "notes"], codeFields: [] },
+    medication_history: {
+        fields: [
+            "name",
+            "dosage",
+            "duration",
+            "start_date",
+            "end_date",
+            "status",
+        ],
+        codeFields: ["rxnorm_code"],
+        listField: "instruction",
+    },
+};
+
+// Handles allergies, conditions, procedures, lifestyle, social, other, medications
+async function sanitizeSimpleList(config, incoming, existing) {
+    if (!Array.isArray(incoming)) return [];
+    const out = [];
+    for (const raw of incoming.slice(0, 40)) {
+        if (!raw || typeof raw !== "object") continue;
+        const entry = {};
+        for (const f of config.fields)
+            entry[f] = str(raw[f], f === "notes" ? 500 : 300);
+        if (config.listField) {
+            entry[config.listField] = (
+                Array.isArray(raw[config.listField])
+                    ? raw[config.listField]
+                    : str(raw[config.listField]).split(";")
+            )
+                .map((x) => str(x, 100))
+                .filter(Boolean)
+                .slice(0, 10);
+        }
+        const hasContent = Object.values(entry).some((v) =>
+            Array.isArray(v) ? v.length > 0 : v,
+        );
+        if (!hasContent || !entry.name) continue;
+
+        const prev = existing.find(
+            (e) => str(e?.name).toLowerCase() === entry.name.toLowerCase(),
+        );
+        if (prev) {
+            for (const k of Object.keys(prev))
+                if (CODE_KEY.test(k)) entry[k] = prev[k];
+        } else {
+            for (const cf of config.codeFields) entry[cf] = "";
+            try {
+                await verifyEntry(entry);
+            } catch (err) {
+                console.log(
+                    "⚠️ Code lookup failed for edited entry:",
+                    err.message,
+                );
+            }
+        }
+        out.push(entry);
+    }
+    return out;
+}
+
+async function sanitizeVitals(incoming, existing) {
+    const base =
+        Array.isArray(existing) && existing.length
+            ? existing
+            : JSON.parse(fs.readFileSync("template.json", "utf-8")).vitals;
+    if (!Array.isArray(incoming)) return base;
+    return base.map((v) => {
+        const match = incoming.find(
+            (iv) =>
+                str(iv?.name).toLowerCase() === str(v.name).toLowerCase() ||
+                str(iv?.loinc_code) === str(v.loinc_code),
+        );
+        return { ...v, value: match ? str(match.value, 30) : v.value };
+    });
+}
+
+async function sanitizeFamilyHistory(incoming, existing) {
+    if (!Array.isArray(incoming)) return [];
+    const out = [];
+    for (const raw of incoming.slice(0, 20)) {
+        if (!raw || typeof raw !== "object") continue;
+        const relationship = str(raw.relationship, 60);
+        const illness = (
+            Array.isArray(raw.illness)
+                ? raw.illness
+                : str(raw.illness).split(",")
+        )
+            .map((x) => str(x, 100))
+            .filter(Boolean)
+            .slice(0, 10);
+        const notes = str(raw.notes, 300);
+        if (!relationship && illness.length === 0 && !notes) continue;
+
+        const prev = existing.find(
+            (e) =>
+                str(e?.relationship).toLowerCase() ===
+                    relationship.toLowerCase() &&
+                JSON.stringify((e?.illness || []).map(String)) ===
+                    JSON.stringify(illness),
+        );
+        const entry = { relationship, illness, notes };
+        if (prev) {
+            entry.snomed_ct_codes = prev.snomed_ct_codes || [];
+            entry.icd10_codes = prev.icd10_codes || [];
+            entry.snomed_ct_codes_verified = prev.snomed_ct_codes_verified;
+            entry.icd10_codes_verified = prev.icd10_codes_verified;
+        } else {
+            entry.snomed_ct_codes = new Array(illness.length).fill("");
+            entry.icd10_codes = new Array(illness.length).fill("");
+            try {
+                await verifyFamilyIllness(entry);
+            } catch (err) {
+                console.log(
+                    "⚠️ Family history code lookup failed:",
+                    err.message,
+                );
+            }
+        }
+        out.push(entry);
+    }
+    return out;
+}
+
+async function sanitizeSystemReview(incoming, existing) {
+    if (!Array.isArray(incoming)) return [];
+    const out = [];
+    for (const raw of incoming.slice(0, 20)) {
+        if (!raw || typeof raw !== "object") continue;
+        const name = str(raw.name, 80);
+        const findingTexts = (
+            Array.isArray(raw.findings)
+                ? raw.findings.map((f) =>
+                      typeof f === "string" ? f : f?.finding,
+                  )
+                : str(raw.findings).split(",")
+        )
+            .map((x) => str(x, 150))
+            .filter(Boolean)
+            .slice(0, 15);
+        const notes = str(raw.notes, 300);
+        if (!name && findingTexts.length === 0 && !notes) continue;
+
+        const prev = existing.find(
+            (e) => str(e?.name).toLowerCase() === name.toLowerCase(),
+        );
+        const prevFindings = prev?.findings || [];
+        const findings = findingTexts.map((finding) => {
+            const p = prevFindings.find(
+                (pf) =>
+                    str(pf?.finding).toLowerCase() === finding.toLowerCase(),
+            );
+            return p ? { ...p, finding } : { finding, snomed_ct_code: "" };
+        });
+        const toVerify = findings.filter((f) => !f.snomed_ct_code);
+        if (toVerify.length) {
+            try {
+                await verifyFindings(toVerify);
+            } catch (err) {
+                console.log("⚠️ Finding code lookup failed:", err.message);
+            }
+        }
+        out.push({ name, findings, notes });
+    }
+    return out;
+}
+
+async function sanitizeInvestigations(incoming, existing) {
+    if (!Array.isArray(incoming)) return [];
+    const out = [];
+    for (const raw of incoming.slice(0, 15)) {
+        if (!raw || typeof raw !== "object") continue;
+        const name = str(raw.name, 120);
+        const date = str(raw.date, 40);
+        const prevInv = existing.find(
+            (e) => str(e?.name).toLowerCase() === name.toLowerCase(),
+        );
+        const prevReadings = prevInv?.readings || [];
+        const readings = [];
+        for (const r of (Array.isArray(raw.readings) ? raw.readings : []).slice(
+            0,
+            20,
+        )) {
+            if (!r || typeof r !== "object") continue;
+            const investigation_name = str(r.investigation_name, 120);
+            if (!investigation_name) continue;
+            const entry = {
+                investigation_name,
+                result: str(r.result, 60),
+                unit: str(r.unit, 30),
+                interpretation: str(r.interpretation, 60),
+                notes: str(r.notes, 200),
+            };
+            const p = prevReadings.find(
+                (pr) =>
+                    str(pr?.investigation_name).toLowerCase() ===
+                    investigation_name.toLowerCase(),
+            );
+            if (p) {
+                entry.loinc_code = p.loinc_code || "";
+                entry.interpretation_snomed_code =
+                    p.interpretation_snomed_code || "";
+            } else {
+                entry.loinc_code = "";
+                entry.interpretation_snomed_code = "";
+                try {
+                    await verifyEntry(entry);
+                } catch (err) {
+                    console.log(
+                        "⚠️ Investigation code lookup failed:",
+                        err.message,
+                    );
+                }
+            }
+            readings.push(entry);
+        }
+        if (!name && !date && readings.length === 0) continue;
+        out.push({ name, date, readings });
+    }
+    return out;
+}
+
+app.put("/consultations/:id/section/:key", async (req, res) => {
+    const { id, key } = req.params;
+    try {
+        const { data: row, error } = await supabase
+            .from("consultations")
+            .select("structured_data")
+            .eq("id", id)
+            .eq("owner_id", req.userId)
+            .maybeSingle();
+        if (error) throw error;
+        if (!row) return res.status(404).json({ error: "Not found" });
+
+        const sd =
+            row.structured_data && typeof row.structured_data === "object"
+                ? row.structured_data
+                : {};
+        const incoming = req.body?.[key];
+        let updatedSection;
+        if (key === "vitals") {
+            updatedSection = await sanitizeVitals(incoming, sd.vitals);
+        } else if (key === "family_history") {
+            updatedSection = await sanitizeFamilyHistory(
+                incoming,
+                Array.isArray(sd.family_history) ? sd.family_history : [],
+            );
+        } else if (key === "system_review") {
+            updatedSection = await sanitizeSystemReview(
+                incoming,
+                Array.isArray(sd.system_review) ? sd.system_review : [],
+            );
+        } else if (key === "investigation_history") {
+            updatedSection = await sanitizeInvestigations(
+                incoming,
+                Array.isArray(sd.investigation_history)
+                    ? sd.investigation_history
+                    : [],
+            );
+        } else if (SIMPLE_SECTIONS[key]) {
+            updatedSection = await sanitizeSimpleList(
+                SIMPLE_SECTIONS[key],
+                incoming,
+                Array.isArray(sd[key]) ? sd[key] : [],
+            );
+        } else {
+            return res.status(400).json({ error: "Unknown section" });
+        }
+        const updated = await afterConsultationEdit(id, {
+            ...sd,
+            [key]: updatedSection,
+        });
+
+        res.json({
+            [key]: updated[key],
+            consultation_summary: updated.consultation_summary,
+        });
+    } catch (err) {
+        console.log(`⚠️ Section update failed (${key}):`, err.message);
         res.status(500).json({ error: "Failed to save changes" });
     }
 });
