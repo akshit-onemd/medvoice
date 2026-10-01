@@ -23,20 +23,63 @@ app.use((req, res, next) => {
 app.use(clerkMiddleware());
 
 // Reject anything without a valid signed-in user
-app.use((req, res, next) => {
+app.use(async (req, res, next) => {
     const { userId } = getAuth(req);
     if (!userId) {
         return res.status(401).json({ error: "Unauthorized" });
     }
-    req.userId = userId;
+    try {
+        const doctorId = await lookupDoctorForStaff(userId);
+        req.actorId = userId; // who is really signed in
+        req.role = doctorId ? "staff" : "doctor";
+        req.userId = doctorId || userId; // owner scope used by every existing filter
+        next();
+    } catch (err) {
+        console.log("⚠️ Role lookup failed:", err.message);
+        res.status(503).json({ error: "Please try again" });
+    }
+});
+
+// Staff may only use these routes. Everything else is denied by default.
+const STAFF_ALLOWED = [
+    ["GET", /^\/me$/],
+    ["GET", /^\/patients\/search$/],
+    ["POST", /^\/patients$/],
+    ["PUT", /^\/patients\/[0-9a-f-]{36}$/i],
+];
+app.use((req, res, next) => {
+    if (req.role !== "staff") return next();
+    const ok = STAFF_ALLOWED.some(
+        ([m, re]) => m === req.method && re.test(req.path),
+    );
+    if (!ok)
+        return res
+            .status(403)
+            .json({ error: "Not available for staff accounts" });
     next();
 });
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 const { createClient } = require("@supabase/supabase-js");
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY,
 );
+const staffCache = new Map(); // staffUserId -> { doctorId | null, at }
+const STAFF_TTL = 60 * 1000;
+
+async function lookupDoctorForStaff(userId) {
+    const hit = staffCache.get(userId);
+    if (hit && Date.now() - hit.at < STAFF_TTL) return hit.doctorId;
+    const { data, error } = await supabase
+        .from("staff_links")
+        .select("doctor_id")
+        .eq("staff_user_id", userId)
+        .maybeSingle();
+    if (error) throw error;
+    const doctorId = data?.doctor_id || null;
+    staffCache.set(userId, { doctorId, at: Date.now() });
+    return doctorId;
+}
 const upload = multer({
     dest: "uploads/",
 });
@@ -1559,6 +1602,166 @@ app.put("/consultations/:id/section/:key", async (req, res) => {
     } catch (err) {
         console.log(`⚠️ Section update failed (${key}):`, err.message);
         res.status(500).json({ error: "Failed to save changes" });
+    }
+});
+app.put("/doctor/letterhead", async (req, res) => {
+    try {
+        const b = req.body || {};
+        const img = b.image_data;
+
+        if (img === null) {
+            const { data, error } = await supabase
+                .from("doctors")
+                .update({
+                    letterhead_data: null,
+                    letterhead_top_pct: null,
+                    letterhead_bottom_pct: null,
+                    updated_at: new Date().toISOString(),
+                })
+                .eq("owner_id", req.userId)
+                .select()
+                .maybeSingle();
+            if (error) throw error;
+            if (!data)
+                return res
+                    .status(404)
+                    .json({ error: "Set up your profile first" });
+            return res.json({ profile: data });
+        }
+
+        if (
+            typeof img !== "string" ||
+            img.length > 1200000 ||
+            !/^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(img)
+        ) {
+            return res.status(400).json({
+                error: "Letterhead must be a PNG or JPEG image (under ~900 KB)",
+            });
+        }
+
+        const top = Number(b.top_pct);
+        const bottom = Number(b.bottom_pct);
+        if (
+            !Number.isFinite(top) ||
+            !Number.isFinite(bottom) ||
+            top < 0 ||
+            top > 60 ||
+            bottom < 40 ||
+            bottom > 100 ||
+            bottom - top < 30
+        ) {
+            return res.status(400).json({ error: "Invalid content area" });
+        }
+
+        const { data, error } = await supabase
+            .from("doctors")
+            .update({
+                letterhead_data: img,
+                letterhead_top_pct: top,
+                letterhead_bottom_pct: bottom,
+                updated_at: new Date().toISOString(),
+            })
+            .eq("owner_id", req.userId)
+            .select()
+            .maybeSingle();
+        if (error) throw error;
+        if (!data)
+            return res.status(404).json({ error: "Set up your profile first" });
+        res.json({ profile: data });
+    } catch (err) {
+        console.log("⚠️ Letterhead save failed:", err.message);
+        res.status(500).json({ error: "Failed to save letterhead" });
+    }
+});
+app.get("/me", async (req, res) => {
+    if (req.role !== "staff") return res.json({ role: "doctor" });
+    let doctorName = null;
+    try {
+        const { data } = await supabase
+            .from("doctors")
+            .select("name")
+            .eq("owner_id", req.userId)
+            .maybeSingle();
+        doctorName = data?.name || null;
+    } catch {
+        /* name is cosmetic */
+    }
+    res.json({ role: "staff", doctor_name: doctorName });
+});
+
+const pstr = (v, max) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+function cleanPatient(b) {
+    const age = parseInt(b?.age, 10);
+    const gender = pstr(b?.gender, 10).toLowerCase();
+    return {
+        name: pstr(b?.name, 120),
+        phone: pstr(b?.phone, 20),
+        age: Number.isFinite(age) && age >= 0 && age <= 120 ? age : null,
+        gender: ["male", "female", "other"].includes(gender) ? gender : null,
+    };
+}
+const PATIENT_COLS = "id, name, age, gender, phone";
+
+app.post("/patients", async (req, res) => {
+    try {
+        const p = cleanPatient(req.body);
+        if (!p.name || !p.phone) {
+            return res
+                .status(400)
+                .json({ error: "Name and phone number are required" });
+        }
+        const { data, error } = await supabase
+            .from("patients")
+            .insert({ ...p, owner_id: req.userId, created_by: req.actorId })
+            .select(PATIENT_COLS)
+            .single();
+        if (error) {
+            if (error.code === "23505") {
+                return res
+                    .status(409)
+                    .json({
+                        error: "A patient with this phone number already exists",
+                    });
+            }
+            throw error;
+        }
+        res.status(201).json({ patient: data });
+    } catch (err) {
+        console.log("⚠️ Patient create failed:", err.message);
+        res.status(500).json({ error: "Failed to add patient" });
+    }
+});
+
+app.put("/patients/:id", async (req, res) => {
+    try {
+        const p = cleanPatient(req.body);
+        if (!p.name || !p.phone) {
+            return res
+                .status(400)
+                .json({ error: "Name and phone number are required" });
+        }
+        const { data, error } = await supabase
+            .from("patients")
+            .update(p) // only these four fields can ever change
+            .eq("id", req.params.id)
+            .eq("owner_id", req.userId)
+            .select(PATIENT_COLS)
+            .maybeSingle();
+        if (error) {
+            if (error.code === "23505") {
+                return res
+                    .status(409)
+                    .json({
+                        error: "Another patient already has this phone number",
+                    });
+            }
+            throw error;
+        }
+        if (!data) return res.status(404).json({ error: "Not found" });
+        res.json({ patient: data });
+    } catch (err) {
+        console.log("⚠️ Patient update failed:", err.message);
+        res.status(500).json({ error: "Failed to update patient" });
     }
 });
 const PORT = process.env.PORT || 8000;
