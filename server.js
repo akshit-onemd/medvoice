@@ -927,7 +927,8 @@ app.post(
                             savedRecord = {
                                 patient_id: patient.id,
                                 patient_name: patient.name,
-                                patient_age: patient.age,
+                                patient_age:
+                                    ageFromDob(patient.dob) ?? patient.age,
                                 patient_gender: patient.gender,
                                 patient_phone: patient.phone,
                                 consultation_id: consultation.id,
@@ -1029,19 +1030,17 @@ app.get("/patients/search", async (req, res) => {
     const query = (req.query.query || "").trim();
     if (query.length < 2) return res.json({ patients: [] });
 
-    try {
-        const { data, error } = await supabase
-            .from("patients")
-            .select("id, name, age, gender, phone")
-            .eq("owner_id", req.userId)
-            .or(`name.ilike.%${query}%,phone.ilike.%${query}%`)
-            .limit(10);
-        if (error) throw error;
-        res.json({ patients: data });
-    } catch (err) {
-        console.log("⚠️ Patient search failed:", err.message);
-        res.status(500).json({ error: "Search failed" });
-    }
+    const digits = query.replace(/[\s\-().]/g, "");
+    const phoneQ = /^\+?\d{3,}$/.test(digits) ? digits : query;
+
+    const { data, error } = await supabase
+        .from("patients")
+        .select(PATIENT_COLS)
+        .eq("owner_id", req.userId)
+        .or(`name.ilike.%${query}%,phone.ilike.%${phoneQ}%`)
+        .limit(10);
+    if (error) throw error;
+    res.json({ patients: data.map(withAge) });
 });
 app.get("/patients/:id/consultations", async (req, res) => {
     const { id } = req.params;
@@ -1074,7 +1073,7 @@ app.get("/consultations/:id", async (req, res) => {
     try {
         const { data, error } = await supabase
             .from("consultations")
-            .select("*, patients(id, name, age, gender, phone)")
+            .select("*, patients(id, name, dob, age, gender, phone)")
             .eq("id", id)
             .eq("owner_id", req.userId)
             .maybeSingle();
@@ -1090,7 +1089,8 @@ app.get("/consultations/:id", async (req, res) => {
             saved: {
                 patient_id: data.patients?.id,
                 patient_name: data.patients?.name,
-                patient_age: data.patients?.age,
+                patient_age:
+                    ageFromDob(data.patients?.dob) ?? data.patients?.age,
                 patient_gender: data.patients?.gender,
                 patient_phone: data.patients?.phone,
                 consultation_id: data.id,
@@ -1689,43 +1689,247 @@ app.get("/me", async (req, res) => {
     res.json({ role: "staff", doctor_name: doctorName });
 });
 
+// const pstr = (v, max) => (typeof v === "string" ? v.trim().slice(0, max) : "");
+// function cleanPatient(b) {
+//     const age = parseInt(b?.age, 10);
+//     const gender = pstr(b?.gender, 10).toLowerCase();
+//     return {
+//         name: pstr(b?.name, 120),
+//         phone: pstr(b?.phone, 20),
+//         age: Number.isFinite(age) && age >= 0 && age <= 120 ? age : null,
+//         gender: ["male", "female", "other"].includes(gender) ? gender : null,
+//     };
+// }
+// const PATIENT_COLS = "id, name, age, gender, phone";
+
+// app.post("/patients", async (req, res) => {
+//     try {
+//         const p = cleanPatient(req.body);
+//         if (!p.name || !p.phone) {
+//             return res
+//                 .status(400)
+//                 .json({ error: "Name and phone number are required" });
+//         }
+//         const { data, error } = await supabase
+//             .from("patients")
+//             .insert({ ...p, owner_id: req.userId, created_by: req.actorId })
+//             .select(PATIENT_COLS)
+//             .single();
+//         if (error) {
+//             if (error.code === "23505") {
+//                 return res
+//                     .status(409)
+//                     .json({
+//                         error: "A patient with this phone number already exists",
+//                     });
+//             }
+//             throw error;
+//         }
+//         res.status(201).json({ patient: data });
+//     } catch (err) {
+//         console.log("⚠️ Patient create failed:", err.message);
+//         res.status(500).json({ error: "Failed to add patient" });
+//     }
+// });
+
+// app.put("/patients/:id", async (req, res) => {
+//     try {
+//         const p = cleanPatient(req.body);
+//         if (!p.name || !p.phone) {
+//             return res
+//                 .status(400)
+//                 .json({ error: "Name and phone number are required" });
+//         }
+//         const { data, error } = await supabase
+//             .from("patients")
+//             .update(p) // only these four fields can ever change
+//             .eq("id", req.params.id)
+//             .eq("owner_id", req.userId)
+//             .select(PATIENT_COLS)
+//             .maybeSingle();
+//         if (error) {
+//             if (error.code === "23505") {
+//                 return res
+//                     .status(409)
+//                     .json({
+//                         error: "Another patient already has this phone number",
+//                     });
+//             }
+//             throw error;
+//         }
+//         if (!data) return res.status(404).json({ error: "Not found" });
+//         res.json({ patient: data });
+//     } catch (err) {
+//         console.log("⚠️ Patient update failed:", err.message);
+//         res.status(500).json({ error: "Failed to update patient" });
+//     }
+// });
 const pstr = (v, max) => (typeof v === "string" ? v.trim().slice(0, max) : "");
-function cleanPatient(b) {
-    const age = parseInt(b?.age, 10);
-    const gender = pstr(b?.gender, 10).toLowerCase();
+const opt = (v, max) => pstr(v, max) || null;
+const PHONE_RE = /^[6-9]\d{9}$/;
+const normPhone = (s) => {
+    let t = s.replace(/[\s\-().]/g, "");
+    if (/^\+?91\d{10}$/.test(t)) t = t.replace(/^\+?91/, "");
+    else if (/^0\d{10}$/.test(t)) t = t.slice(1);
+    return t;
+};
+const NAME_RE = /^[\p{L}\p{M}][\p{L}\p{M}\s.'-]*$/u;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const PIN_RE = /^\d{6}$/;
+const UHID_RE = /^[A-Za-z0-9\-_/]{1,40}$/;
+const GENDERS = ["male", "female", "other"];
+const TITLES = ["Mr.", "Mrs.", "Ms.", "Miss", "Master", "Dr."];
+const MARITAL = ["Single", "Married", "Divorced", "Widowed", "Separated"];
+const BLOOD = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"];
+const YES_NO = ["Yes", "No"];
+const HISTORY_KEYS = ["diabetes", "hypertension", "hypothyroidism"];
+const HABIT_KEYS = ["alcohol", "tobacco", "smoke"];
+
+const PATIENT_COLS =
+    "id, name, dob, age, gender, phone, title, uhid, marital_status, occupation, alt_phone, email, address, city, pincode, informant_name, channel, tag, referred_by_name, referred_by_phone, medical";
+
+function ageFromDob(dob) {
+    if (!dob) return null;
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dob));
+    if (!m) return null;
+    const now = new Date();
+    let age = now.getFullYear() - +m[1];
+    const before =
+        now.getMonth() + 1 < +m[2] ||
+        (now.getMonth() + 1 === +m[2] && now.getDate() < +m[3]);
+    if (before) age--;
+    return age >= 0 ? age : null;
+}
+const withAge = (p) =>
+    p ? { ...p, age: p.dob ? ageFromDob(p.dob) : p.age } : p;
+
+function parseDob(v) {
+    const s = pstr(v, 10);
+    if (!s) return { value: null };
+    const d = new Date(`${s}T00:00:00Z`);
+    if (
+        !/^\d{4}-\d{2}-\d{2}$/.test(s) ||
+        Number.isNaN(d.getTime()) ||
+        d.toISOString().slice(0, 10) !== s
+    ) {
+        return { error: "Enter a valid date of birth" };
+    }
+    const age = ageFromDob(s);
+    if (age === null) return { error: "Date of birth can't be in the future" };
+    if (age > 120) return { error: "Enter a valid date of birth" };
+    return { value: s };
+}
+
+function oneOf(v, list, label) {
+    const s = pstr(v, 30);
+    if (!s) return { value: null };
+    return list.includes(s)
+        ? { value: s }
+        : { error: `Select a valid ${label}` };
+}
+
+function cleanPatient(b = {}) {
+    const name = pstr(b.name, 120).replace(/\s+/g, " ");
+    if (name.length < 2 || !NAME_RE.test(name))
+        return { error: "Enter a valid name" };
+
+    const phone = normPhone(pstr(b.phone, 25));
+    if (!PHONE_RE.test(phone))
+        return { error: "Enter a valid 10-digit phone number" };
+
+    const dob = parseDob(b.dob);
+    if (dob.error) return dob;
+
+    const gender = pstr(b.gender, 10).toLowerCase();
+    if (gender && !GENDERS.includes(gender))
+        return { error: "Select a valid gender" };
+
+    const title = oneOf(b.title, TITLES, "title");
+    if (title.error) return title;
+    const marital = oneOf(b.marital_status, MARITAL, "marital status");
+    if (marital.error) return marital;
+
+    const uhid = pstr(b.uhid, 40);
+    if (uhid && !UHID_RE.test(uhid)) return { error: "Enter a valid UHID" };
+
+    const email = pstr(b.email, 120).toLowerCase();
+    if (email && !EMAIL_RE.test(email)) return { error: "Enter a valid email" };
+
+    const altPhone = normPhone(pstr(b.alt_phone, 25));
+    if (altPhone && !PHONE_RE.test(altPhone))
+        return { error: "Enter a valid 10-digit alternative phone" };
+    const refPhone = normPhone(pstr(b.referred_by_phone, 25));
+    if (refPhone && !PHONE_RE.test(refPhone))
+        return { error: "Enter a valid 10-digit referrer phone" };
+    const pincode = pstr(b.pincode, 10);
+    if (pincode && !PIN_RE.test(pincode))
+        return { error: "Enter a valid 6-digit pincode" };
+
+    const m = b.medical && typeof b.medical === "object" ? b.medical : {};
+    const medical = {};
+    const bg = oneOf(m.blood_group, BLOOD, "blood group");
+    if (bg.error) return bg;
+    if (bg.value) medical.blood_group = bg.value;
+    for (const k of [...HISTORY_KEYS, ...HABIT_KEYS]) {
+        const s = oneOf(m[k], YES_NO, k);
+        if (s.error) return s;
+        if (s.value) medical[k] = s.value;
+    }
+    if (m.no_known_history === true) {
+        medical.no_known_history = true;
+        HISTORY_KEYS.forEach((k) => delete medical[k]);
+    }
+
     return {
-        name: pstr(b?.name, 120),
-        phone: pstr(b?.phone, 20),
-        age: Number.isFinite(age) && age >= 0 && age <= 120 ? age : null,
-        gender: ["male", "female", "other"].includes(gender) ? gender : null,
+        value: {
+            name,
+            phone,
+            dob: dob.value,
+            gender: gender || null,
+            title: title.value,
+            uhid: uhid || null,
+            marital_status: marital.value,
+            occupation: opt(b.occupation, 80),
+            alt_phone: altPhone || null,
+            email: email || null,
+            address: opt(b.address, 300),
+            city: opt(b.city, 80),
+            pincode: pincode || null,
+            informant_name: opt(b.informant_name, 120),
+            channel: opt(b.channel, 80),
+            tag: opt(b.tag, 80),
+            referred_by_name: opt(b.referred_by_name, 120),
+            referred_by_phone: refPhone || null,
+            medical: Object.keys(medical).length ? medical : null,
+        },
     };
 }
-const PATIENT_COLS = "id, name, age, gender, phone";
+
+const dupMessage = (error) =>
+    String(error.message || "").includes("uhid")
+        ? "This UHID already exists"
+        : "A patient with this phone number already exists";
 
 app.post("/patients", async (req, res) => {
     try {
-        const p = cleanPatient(req.body);
-        if (!p.name || !p.phone) {
-            return res
-                .status(400)
-                .json({ error: "Name and phone number are required" });
-        }
+        const c = cleanPatient(req.body);
+        if (c.error) return res.status(400).json({ error: c.error });
         const { data, error } = await supabase
             .from("patients")
-            .insert({ ...p, owner_id: req.userId, created_by: req.actorId })
+            .insert({
+                ...c.value,
+                age: ageFromDob(c.value.dob),
+                owner_id: req.userId,
+                created_by: req.actorId,
+            })
             .select(PATIENT_COLS)
             .single();
         if (error) {
-            if (error.code === "23505") {
-                return res
-                    .status(409)
-                    .json({
-                        error: "A patient with this phone number already exists",
-                    });
-            }
+            if (error.code === "23505")
+                return res.status(409).json({ error: dupMessage(error) });
             throw error;
         }
-        res.status(201).json({ patient: data });
+        res.status(201).json({ patient: withAge(data) });
     } catch (err) {
         console.log("⚠️ Patient create failed:", err.message);
         res.status(500).json({ error: "Failed to add patient" });
@@ -1734,31 +1938,24 @@ app.post("/patients", async (req, res) => {
 
 app.put("/patients/:id", async (req, res) => {
     try {
-        const p = cleanPatient(req.body);
-        if (!p.name || !p.phone) {
-            return res
-                .status(400)
-                .json({ error: "Name and phone number are required" });
-        }
+        const c = cleanPatient(req.body);
+        if (c.error) return res.status(400).json({ error: c.error });
+        const update = { ...c.value };
+        if (c.value.dob) update.age = ageFromDob(c.value.dob);
         const { data, error } = await supabase
             .from("patients")
-            .update(p) // only these four fields can ever change
+            .update(update)
             .eq("id", req.params.id)
             .eq("owner_id", req.userId)
             .select(PATIENT_COLS)
             .maybeSingle();
         if (error) {
-            if (error.code === "23505") {
-                return res
-                    .status(409)
-                    .json({
-                        error: "Another patient already has this phone number",
-                    });
-            }
+            if (error.code === "23505")
+                return res.status(409).json({ error: dupMessage(error) });
             throw error;
         }
         if (!data) return res.status(404).json({ error: "Not found" });
-        res.json({ patient: data });
+        res.json({ patient: withAge(data) });
     } catch (err) {
         console.log("⚠️ Patient update failed:", err.message);
         res.status(500).json({ error: "Failed to update patient" });
