@@ -14,11 +14,14 @@ const { clerkMiddleware, getAuth } = require("@clerk/express");
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*"); // ideally your frontend URL
     res.header("Access-Control-Allow-Headers", "Authorization, Content-Type");
-    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+    res.header(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PUT, DELETE, OPTIONS",
+    );
     if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
 });
-
+app.get("/health", (req, res) => res.json({ ok: true }));
 // Attach Clerk session info to every request
 app.use(clerkMiddleware());
 
@@ -46,6 +49,10 @@ const STAFF_ALLOWED = [
     ["GET", /^\/patients\/search$/],
     ["POST", /^\/patients$/],
     ["PUT", /^\/patients\/[0-9a-f-]{36}$/i],
+    ["GET", /^\/patients$/],
+    ["GET", /^\/rate-card$/],
+    ["GET", /^\/patients\/[0-9a-f-]{36}\/pending-services$/i],
+    ["PUT", /^\/patients\/[0-9a-f-]{36}\/pending-services$/i],
 ];
 app.use((req, res, next) => {
     if (req.role !== "staff") return next();
@@ -1160,7 +1167,16 @@ app.put("/doctor/profile", async (req, res) => {
 
         const clean = (v, max = 200) =>
             (typeof v === "string" ? v.trim().slice(0, max) : "") || null;
-
+        const mobile = normPhone(
+            typeof b.mobile === "string" ? b.mobile.trim().slice(0, 25) : "",
+        );
+        if (!mobile)
+            return res.status(400).json({ error: "Mobile number is required" });
+        if (!PHONE_RE.test(mobile)) {
+            return res
+                .status(400)
+                .json({ error: "Enter a valid 10-digit mobile number" });
+        }
         const { data, error } = await supabase
             .from("doctors")
             .upsert(
@@ -1173,6 +1189,8 @@ app.put("/doctor/profile", async (req, res) => {
                     clinic_name: clean(b.clinic_name),
                     clinic_address: clean(b.clinic_address, 300),
                     signature_data: sig,
+                    mobile,
+                    council_name: clean(b.council_name, 120),
                     updated_at: new Date().toISOString(),
                 },
                 { onConflict: "owner_id" },
@@ -1674,19 +1692,26 @@ app.put("/doctor/letterhead", async (req, res) => {
     }
 });
 app.get("/me", async (req, res) => {
-    if (req.role !== "staff") return res.json({ role: "doctor" });
-    let doctorName = null;
     try {
-        const { data } = await supabase
+        if (req.role === "staff") {
+            const { data } = await supabase
+                .from("doctors")
+                .select("name")
+                .eq("owner_id", req.userId)
+                .maybeSingle();
+            return res.json({ role: "staff", doctor_name: data?.name || null });
+        }
+        const { data, error } = await supabase
             .from("doctors")
-            .select("name")
+            .select("*")
             .eq("owner_id", req.userId)
             .maybeSingle();
-        doctorName = data?.name || null;
-    } catch {
-        /* name is cosmetic */
+        if (error) throw error;
+        res.json({ role: "doctor", profile: data || null });
+    } catch (err) {
+        console.log("⚠️ /me failed:", err.message);
+        res.status(500).json({ error: "Couldn't load account" });
     }
-    res.json({ role: "staff", doctor_name: doctorName });
 });
 
 // const pstr = (v, max) => (typeof v === "string" ? v.trim().slice(0, max) : "");
@@ -1959,6 +1984,736 @@ app.put("/patients/:id", async (req, res) => {
     } catch (err) {
         console.log("⚠️ Patient update failed:", err.message);
         res.status(500).json({ error: "Failed to update patient" });
+    }
+});
+app.get("/patients", async (req, res) => {
+    try {
+        const limit = Math.min(
+            Math.max(parseInt(req.query.limit, 10) || 20, 1),
+            50,
+        );
+        const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+        const q = String(req.query.q || "")
+            .replace(/[%_\\,()]/g, " ")
+            .trim();
+        const digits = q.replace(/[\s\-().]/g, "");
+        const term = /^\+?\d{3,}$/.test(digits) ? digits : q;
+
+        const { data, error } = await supabase.rpc("list_patients", {
+            p_owner: req.userId,
+            p_q: term,
+            p_limit: limit + 1, // one extra row tells if more exist
+            p_offset: offset,
+        });
+        if (error) throw error;
+
+        const hasMore = data.length > limit;
+        const patients = data
+            .slice(0, limit)
+            .map(withAge)
+            .map((r) => {
+                if (req.role === "staff") {
+                    const { last_visit, visit_count, ...rest } = r; // staff never see visit data
+                    return rest;
+                }
+                return { ...r, visit_count: Number(r.visit_count) };
+            });
+        res.json({ patients, hasMore });
+    } catch (err) {
+        console.log("⚠️ Patient list failed:", err.message);
+        res.status(500).json({ error: "Failed to load patients" });
+    }
+});
+const num2 = (v, min, max) => {
+    const n = typeof v === "number" ? v : Number(String(v ?? "").trim());
+    if (!Number.isFinite(n) || n < min || n > max) return null;
+    return Math.round(n * 100) / 100;
+};
+
+async function cleanTax(b) {
+    const name = pstr(b?.name, 40).replace(/\s+/g, " ");
+    if (name.length < 2) return { error: "Enter a tax name" };
+    const rate = num2(b?.rate, 0, 100);
+    if (rate === null) return { error: "Rate must be 0 to 100" };
+    return { value: { name, rate } };
+}
+
+async function cleanService(b, owner) {
+    const name = pstr(b?.name, 80).replace(/\s+/g, " ");
+    if (name.length < 2) return { error: "Enter a service name" };
+    const fee = num2(b?.fee, 0, 10000000);
+    if (fee === null) return { error: "Enter a valid fee" };
+    let tax_id = null;
+    if (b?.tax_id) {
+        const { data } = await supabase
+            .from("tax_brackets")
+            .select("id")
+            .eq("id", String(b.tax_id))
+            .eq("owner_id", owner)
+            .maybeSingle();
+        if (!data) return { error: "Select a valid tax" };
+        tax_id = data.id;
+    }
+    return { value: { name, fee, tax_id, active: b?.active !== false } };
+}
+
+app.get("/rate-card", async (req, res) => {
+    try {
+        const [svc, tax] = await Promise.all([
+            supabase
+                .from("services")
+                .select("id, name, fee, tax_id, active")
+                .eq("owner_id", req.userId)
+                .order("name"),
+            supabase
+                .from("tax_brackets")
+                .select("id, name, rate")
+                .eq("owner_id", req.userId)
+                .order("name"),
+        ]);
+        if (svc.error) throw svc.error;
+        if (tax.error) throw tax.error;
+        let services = svc.data.map((s) => ({ ...s, fee: Number(s.fee) }));
+        if (req.role === "staff") services = services.filter((s) => s.active);
+        res.json({
+            services,
+            taxes: tax.data.map((t) => ({ ...t, rate: Number(t.rate) })),
+        });
+    } catch (err) {
+        console.log("⚠️ Rate card load failed:", err.message);
+        res.status(500).json({ error: "Failed to load rate card" });
+    }
+});
+
+app.post("/taxes", async (req, res) => {
+    try {
+        const c = await cleanTax(req.body);
+        if (c.error) return res.status(400).json({ error: c.error });
+        const { data, error } = await supabase
+            .from("tax_brackets")
+            .insert({ ...c.value, owner_id: req.userId })
+            .select("id, name, rate")
+            .single();
+        if (error) {
+            if (error.code === "23505")
+                return res
+                    .status(409)
+                    .json({ error: "A tax with this name exists" });
+            throw error;
+        }
+        res.status(201).json({ tax: data });
+    } catch (err) {
+        console.log("⚠️ Tax create failed:", err.message);
+        res.status(500).json({ error: "Failed to save tax" });
+    }
+});
+
+app.put("/taxes/:id", async (req, res) => {
+    try {
+        const c = await cleanTax(req.body);
+        if (c.error) return res.status(400).json({ error: c.error });
+        const { data, error } = await supabase
+            .from("tax_brackets")
+            .update(c.value)
+            .eq("id", req.params.id)
+            .eq("owner_id", req.userId)
+            .select("id, name, rate")
+            .maybeSingle();
+        if (error) {
+            if (error.code === "23505")
+                return res
+                    .status(409)
+                    .json({ error: "A tax with this name exists" });
+            throw error;
+        }
+        if (!data) return res.status(404).json({ error: "Not found" });
+        res.json({ tax: data });
+    } catch (err) {
+        console.log("⚠️ Tax update failed:", err.message);
+        res.status(500).json({ error: "Failed to save tax" });
+    }
+});
+
+app.delete("/taxes/:id", async (req, res) => {
+    try {
+        const { count, error: cErr } = await supabase
+            .from("services")
+            .select("id", { count: "exact", head: true })
+            .eq("owner_id", req.userId)
+            .eq("tax_id", req.params.id);
+        if (cErr) throw cErr;
+        if (count > 0) {
+            return res.status(409).json({
+                error: `Used by ${count} service${count === 1 ? "" : "s"}. Change them first.`,
+            });
+        }
+        const { error } = await supabase
+            .from("tax_brackets")
+            .delete()
+            .eq("id", req.params.id)
+            .eq("owner_id", req.userId);
+        if (error) throw error;
+        res.json({ ok: true });
+    } catch (err) {
+        console.log("⚠️ Tax delete failed:", err.message);
+        res.status(500).json({ error: "Failed to delete tax" });
+    }
+});
+
+app.post("/services", async (req, res) => {
+    try {
+        const c = await cleanService(req.body, req.userId);
+        if (c.error) return res.status(400).json({ error: c.error });
+        const { data, error } = await supabase
+            .from("services")
+            .insert({ ...c.value, owner_id: req.userId })
+            .select("id, name, fee, tax_id, active")
+            .single();
+        if (error) {
+            if (error.code === "23505")
+                return res
+                    .status(409)
+                    .json({ error: "A service with this name exists" });
+            throw error;
+        }
+        res.status(201).json({ service: { ...data, fee: Number(data.fee) } });
+    } catch (err) {
+        console.log("⚠️ Service create failed:", err.message);
+        res.status(500).json({ error: "Failed to save service" });
+    }
+});
+
+app.put("/services/:id", async (req, res) => {
+    try {
+        const c = await cleanService(req.body, req.userId);
+        if (c.error) return res.status(400).json({ error: c.error });
+        const { data, error } = await supabase
+            .from("services")
+            .update(c.value)
+            .eq("id", req.params.id)
+            .eq("owner_id", req.userId)
+            .select("id, name, fee, tax_id, active")
+            .maybeSingle();
+        if (error) {
+            if (error.code === "23505")
+                return res
+                    .status(409)
+                    .json({ error: "A service with this name exists" });
+            throw error;
+        }
+        if (!data) return res.status(404).json({ error: "Not found" });
+        res.json({ service: { ...data, fee: Number(data.fee) } });
+    } catch (err) {
+        console.log("⚠️ Service update failed:", err.message);
+        res.status(500).json({ error: "Failed to save service" });
+    }
+});
+
+app.delete("/services/:id", async (req, res) => {
+    try {
+        const { error } = await supabase
+            .from("services")
+            .delete()
+            .eq("id", req.params.id)
+            .eq("owner_id", req.userId);
+        if (error) throw error;
+        res.json({ ok: true });
+    } catch (err) {
+        console.log("⚠️ Service delete failed:", err.message);
+        res.status(500).json({ error: "Failed to delete service" });
+    }
+});
+const UUID_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+const pendingCutoff = () => new Date(Date.now() - PENDING_TTL_MS).toISOString();
+
+async function ownsPatient(id, owner) {
+    if (!UUID_RE.test(id)) return false;
+    const { data } = await supabase
+        .from("patients")
+        .select("id")
+        .eq("id", id)
+        .eq("owner_id", owner)
+        .maybeSingle();
+    return !!data;
+}
+
+// Validates [{service_id, qty}]. Returns { value } or { error }.
+async function cleanItems(raw, owner, activeOnly) {
+    if (!Array.isArray(raw) || raw.length > 50)
+        return { error: "Invalid services" };
+    const map = new Map();
+    for (const r of raw) {
+        const id = String(r?.service_id || "");
+        const qty = Number(r?.qty);
+        if (!UUID_RE.test(id)) return { error: "Invalid service" };
+        if (!Number.isInteger(qty) || qty < 1 || qty > 99) {
+            return { error: "Quantity must be 1 to 99" };
+        }
+        map.set(id, qty);
+    }
+    const ids = [...map.keys()];
+    if (ids.length) {
+        const { data, error } = await supabase
+            .from("services")
+            .select("id, active")
+            .eq("owner_id", owner)
+            .in("id", ids);
+        if (error) throw error;
+        if (data.length !== ids.length) return { error: "Unknown service" };
+        if (activeOnly && data.some((s) => !s.active)) {
+            return { error: "A selected service is not available" };
+        }
+    }
+    return { value: ids.map((id) => ({ service_id: id, qty: map.get(id) })) };
+}
+
+// Drops expired rows, then returns live pending items for a patient
+async function livePendingItems(patientId, owner, activeOnly) {
+    await supabase
+        .from("patient_pending_services")
+        .delete()
+        .eq("owner_id", owner)
+        .lt("created_at", pendingCutoff());
+    const { data, error } = await supabase
+        .from("patient_pending_services")
+        .select("service_id, qty, services(active)")
+        .eq("owner_id", owner)
+        .eq("patient_id", patientId)
+        .order("created_at");
+    if (error) throw error;
+    return data
+        .filter((r) => !activeOnly || r.services?.active)
+        .map((r) => ({ service_id: r.service_id, qty: r.qty }));
+}
+
+app.get("/patients/:id/pending-services", async (req, res) => {
+    try {
+        if (!(await ownsPatient(req.params.id, req.userId))) {
+            return res.status(404).json({ error: "Not found" });
+        }
+        const items = await livePendingItems(
+            req.params.id,
+            req.userId,
+            req.role === "staff",
+        );
+        res.json({ items });
+    } catch (err) {
+        console.log("⚠️ Pending services load failed:", err.message);
+        res.status(500).json({ error: "Failed to load services" });
+    }
+});
+
+app.put("/patients/:id/pending-services", async (req, res) => {
+    try {
+        const id = req.params.id;
+        if (!(await ownsPatient(id, req.userId))) {
+            return res.status(404).json({ error: "Not found" });
+        }
+        const c = await cleanItems(
+            req.body?.items,
+            req.userId,
+            req.role === "staff",
+        );
+        if (c.error) return res.status(400).json({ error: c.error });
+
+        const del = await supabase
+            .from("patient_pending_services")
+            .delete()
+            .eq("owner_id", req.userId)
+            .eq("patient_id", id);
+        if (del.error) throw del.error;
+
+        if (c.value.length) {
+            const ins = await supabase.from("patient_pending_services").insert(
+                c.value.map((i) => ({
+                    owner_id: req.userId,
+                    patient_id: id,
+                    service_id: i.service_id,
+                    qty: i.qty,
+                    added_by: req.actorId,
+                })),
+            );
+            if (ins.error) throw ins.error;
+        }
+        res.json({ items: c.value });
+    } catch (err) {
+        console.log("⚠️ Pending services save failed:", err.message);
+        res.status(500).json({ error: "Failed to save services" });
+    }
+});
+
+app.get("/consultations/:id/services", async (req, res) => {
+    try {
+        const id = req.params.id;
+        if (!UUID_RE.test(id))
+            return res.status(404).json({ error: "Not found" });
+        const { data: c, error } = await supabase
+            .from("consultations")
+            .select("id, patient_id, created_at, service_items")
+            .eq("id", id)
+            .eq("owner_id", req.userId)
+            .maybeSingle();
+        if (error) throw error;
+        if (!c) return res.status(404).json({ error: "Not found" });
+
+        let items = [];
+        let source = "none";
+        if (Array.isArray(c.service_items)) {
+            items = c.service_items;
+            source = "saved";
+        } else if (
+            new Date(c.created_at).getTime() >
+            Date.now() - PENDING_TTL_MS
+        ) {
+            items = await livePendingItems(c.patient_id, req.userId, false);
+            source = "pending";
+        }
+
+        // Drop services deleted since
+        const ids = items
+            .map((i) => i.service_id)
+            .filter((x) => UUID_RE.test(x));
+        if (ids.length) {
+            const { data: found } = await supabase
+                .from("services")
+                .select("id")
+                .eq("owner_id", req.userId)
+                .in("id", ids);
+            const ok = new Set((found || []).map((s) => s.id));
+            items = items.filter((i) => ok.has(i.service_id));
+        } else {
+            items = [];
+        }
+        res.json({ items, source });
+    } catch (err) {
+        console.log("⚠️ Consultation services load failed:", err.message);
+        res.status(500).json({ error: "Failed to load services" });
+    }
+});
+
+app.put("/consultations/:id/services", async (req, res) => {
+    try {
+        const id = req.params.id;
+        if (!UUID_RE.test(id))
+            return res.status(404).json({ error: "Not found" });
+        const { data: c, error } = await supabase
+            .from("consultations")
+            .select("id, patient_id")
+            .eq("id", id)
+            .eq("owner_id", req.userId)
+            .maybeSingle();
+        if (error) throw error;
+        if (!c) return res.status(404).json({ error: "Not found" });
+
+        const v = await cleanItems(req.body?.items, req.userId, false);
+        if (v.error) return res.status(400).json({ error: v.error });
+
+        const up = await supabase
+            .from("consultations")
+            .update({ service_items: v.value })
+            .eq("id", id)
+            .eq("owner_id", req.userId);
+        if (up.error) throw up.error;
+
+        // Pending list consumed
+        await supabase
+            .from("patient_pending_services")
+            .delete()
+            .eq("owner_id", req.userId)
+            .eq("patient_id", c.patient_id);
+        try {
+            await refreshBillIfAny(id, req.userId);
+        } catch (err) {
+            console.log("⚠️ Bill refresh failed:", err.message);
+        }
+        res.json({ items: v.value });
+    } catch (err) {
+        console.log("⚠️ Consultation services save failed:", err.message);
+        res.status(500).json({ error: "Failed to save services" });
+    }
+});
+const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+const istDate = () =>
+    new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" })
+        .format(new Date())
+        .replace(/-/g, "");
+
+const nameSlug = (n) => {
+    const s = String(n || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .split(/[^A-Za-z0-9]+/)
+        .filter(Boolean)
+        .map((w) => w[0].toUpperCase() + w.slice(1))
+        .join("")
+        .slice(0, 24);
+    return s || "Patient";
+};
+
+const BILL_COLS =
+    "id, bill_no, consultation_id, patient, items, tax_summary, subtotal, tax_total, round_off, total, created_at, updated_at";
+
+const shapeBill = (b) =>
+    b && {
+        ...b,
+        subtotal: Number(b.subtotal),
+        tax_total: Number(b.tax_total),
+        round_off: Number(b.round_off),
+        total: Number(b.total),
+    };
+
+// Freezes saved services at current rates into bill fields
+async function buildBillData(consultationId, owner) {
+    const { data: c, error } = await supabase
+        .from("consultations")
+        .select("id, patient_id, service_items")
+        .eq("id", consultationId)
+        .eq("owner_id", owner)
+        .maybeSingle();
+    if (error) throw error;
+    if (!c) return { notFound: true };
+
+    const saved = Array.isArray(c.service_items) ? c.service_items : [];
+    if (saved.length === 0)
+        return { error: "Save services on this consultation first" };
+
+    const ids = saved.map((i) => i.service_id).filter((x) => UUID_RE.test(x));
+    const { data: svcs, error: sErr } = await supabase
+        .from("services")
+        .select("id, name, fee, tax_id")
+        .eq("owner_id", owner)
+        .in("id", ids);
+    if (sErr) throw sErr;
+    const svcMap = new Map(svcs.map((s) => [s.id, s]));
+
+    const taxIds = [...new Set(svcs.map((s) => s.tax_id).filter(Boolean))];
+    let taxMap = new Map();
+    if (taxIds.length) {
+        const { data: taxes, error: tErr } = await supabase
+            .from("tax_brackets")
+            .select("id, name, rate")
+            .eq("owner_id", owner)
+            .in("id", taxIds);
+        if (tErr) throw tErr;
+        taxMap = new Map(taxes.map((t) => [t.id, t]));
+    }
+
+    const items = [];
+    const groups = new Map();
+    let subtotal = 0;
+    let taxTotal = 0;
+    for (const it of saved) {
+        const s = svcMap.get(it.service_id);
+        if (!s) continue;
+        const t = taxMap.get(s.tax_id);
+        const fee = Number(s.fee);
+        const rate = t ? Number(t.rate) : 0;
+        const qty = Number(it.qty);
+        const base = r2(fee * qty);
+        const tax = r2((base * rate) / 100);
+        items.push({
+            service_id: s.id,
+            name: s.name,
+            fee,
+            qty,
+            tax_name: t ? t.name : null,
+            tax_rate: rate,
+            base,
+            tax,
+            total: r2(base + tax),
+        });
+        subtotal += base;
+        taxTotal += tax;
+        if (t) {
+            const key = `${t.name}|${rate}`;
+            const g = groups.get(key) || {
+                name: t.name,
+                rate,
+                taxable: 0,
+                tax: 0,
+            };
+            g.taxable = r2(g.taxable + base);
+            g.tax = r2(g.tax + tax);
+            groups.set(key, g);
+        }
+    }
+    if (!items.length) return { error: "Selected services no longer exist" };
+
+    subtotal = r2(subtotal);
+    taxTotal = r2(taxTotal);
+    const grand = r2(subtotal + taxTotal);
+    const total = Math.round(grand);
+    const round_off = r2(total - grand);
+
+    const { data: p, error: pErr } = await supabase
+        .from("patients")
+        .select("name, dob, age, gender, phone")
+        .eq("id", c.patient_id)
+        .eq("owner_id", owner)
+        .maybeSingle();
+    if (pErr) throw pErr;
+    const pt = withAge(p) || {};
+
+    return {
+        value: {
+            patient_id: c.patient_id,
+            patient: {
+                name: pt.name || "",
+                age: pt.age ?? null,
+                gender: pt.gender || "",
+                phone: pt.phone || "",
+            },
+            items,
+            tax_summary: [...groups.values()],
+            subtotal,
+            tax_total: taxTotal,
+            round_off,
+            total,
+        },
+    };
+}
+
+async function insertBill(owner, consultationId, v) {
+    const base = `INV-${istDate()}-${nameSlug(v.patient.name)}`;
+    for (let n = 1; n <= 25; n++) {
+        const bill_no = n === 1 ? base : `${base}-${n}`;
+        const { data, error } = await supabase
+            .from("bills")
+            .insert({
+                owner_id: owner,
+                consultation_id: consultationId,
+                bill_no,
+                ...v,
+            })
+            .select(BILL_COLS)
+            .single();
+        if (!error) return data;
+        if (error.code !== "23505") throw error;
+        // Double click raced us: bill for this consultation already exists
+        if (String(error.message).includes("bills_consultation_key")) {
+            const { data: ex } = await supabase
+                .from("bills")
+                .select(BILL_COLS)
+                .eq("owner_id", owner)
+                .eq("consultation_id", consultationId)
+                .maybeSingle();
+            if (ex) return ex;
+        }
+    }
+    throw new Error("Couldn't allocate a bill number");
+}
+
+// After services change: rebuild existing bill. Same number. Delete if services emptied.
+async function refreshBillIfAny(consultationId, owner) {
+    const { data: existing } = await supabase
+        .from("bills")
+        .select("id")
+        .eq("owner_id", owner)
+        .eq("consultation_id", consultationId)
+        .maybeSingle();
+    if (!existing) return;
+    const v = await buildBillData(consultationId, owner);
+    if (!v.value) {
+        await supabase.from("bills").delete().eq("id", existing.id);
+        return;
+    }
+    const { error } = await supabase
+        .from("bills")
+        .update({ ...v.value, updated_at: new Date().toISOString() })
+        .eq("id", existing.id);
+    if (error) throw error;
+}
+
+app.post("/consultations/:id/bill", async (req, res) => {
+    try {
+        const id = req.params.id;
+        if (!UUID_RE.test(id))
+            return res.status(404).json({ error: "Not found" });
+
+        const { data: existing, error: eErr } = await supabase
+            .from("bills")
+            .select(BILL_COLS)
+            .eq("owner_id", req.userId)
+            .eq("consultation_id", id)
+            .maybeSingle();
+        if (eErr) throw eErr;
+        if (existing) return res.json({ bill: shapeBill(existing) });
+
+        const v = await buildBillData(id, req.userId);
+        if (v.notFound) return res.status(404).json({ error: "Not found" });
+        if (v.error) return res.status(400).json({ error: v.error });
+
+        const bill = await insertBill(req.userId, id, v.value);
+        res.status(201).json({ bill: shapeBill(bill) });
+    } catch (err) {
+        console.log("⚠️ Bill generation failed:", err.message);
+        res.status(500).json({ error: "Failed to generate bill" });
+    }
+});
+function checkLetterhead(img, top, bottom) {
+    if (
+        typeof img !== "string" ||
+        img.length > 1200000 ||
+        !/^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(img)
+    ) {
+        return "Letterhead must be a PNG or JPEG image (under ~900 KB)";
+    }
+    const t = Number(top);
+    const b = Number(bottom);
+    if (
+        !Number.isFinite(t) ||
+        !Number.isFinite(b) ||
+        t < 0 ||
+        t > 60 ||
+        b < 40 ||
+        b > 100 ||
+        b - t < 30
+    ) {
+        return "Invalid content area";
+    }
+    return null;
+}
+
+app.put("/doctor/bill-letterhead", async (req, res) => {
+    try {
+        const b = req.body || {};
+        const update = {};
+        if (typeof b.same === "boolean") update.bill_letterhead_same = b.same;
+
+        if (b.image_data === null) {
+            update.bill_letterhead_data = null;
+            update.bill_letterhead_top_pct = null;
+            update.bill_letterhead_bottom_pct = null;
+        } else if (b.image_data !== undefined) {
+            const err = checkLetterhead(b.image_data, b.top_pct, b.bottom_pct);
+            if (err) return res.status(400).json({ error: err });
+            update.bill_letterhead_data = b.image_data;
+            update.bill_letterhead_top_pct = Number(b.top_pct);
+            update.bill_letterhead_bottom_pct = Number(b.bottom_pct);
+            update.bill_letterhead_same = false; // own image implies not same
+        }
+
+        if (Object.keys(update).length === 0) {
+            return res.status(400).json({ error: "Nothing to update" });
+        }
+        update.updated_at = new Date().toISOString();
+
+        const { data, error } = await supabase
+            .from("doctors")
+            .update(update)
+            .eq("owner_id", req.userId)
+            .select()
+            .maybeSingle();
+        if (error) throw error;
+        if (!data)
+            return res.status(404).json({ error: "Set up your profile first" });
+        res.json({ profile: data });
+    } catch (err) {
+        console.log("⚠️ Bill letterhead save failed:", err.message);
+        res.status(500).json({ error: "Failed to save bill letterhead" });
     }
 });
 const PORT = process.env.PORT || 8000;
