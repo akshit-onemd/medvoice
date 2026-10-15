@@ -1,4 +1,5 @@
 const express = require("express");
+const { randomUUID } = require("crypto");
 const multer = require("multer");
 const axios = require("axios");
 const fs = require("fs");
@@ -693,7 +694,7 @@ app.post(
     "/process-audio",
     upload.fields([
         { name: "file", maxCount: 1 },
-        { name: "attachments", maxCount: 10 },
+        { name: "attachments", maxCount: 20 },
     ]),
     async (req, res) => {
         const startTime = Date.now();
@@ -2054,15 +2055,24 @@ async function cleanService(b, owner) {
         if (!data) return { error: "Select a valid tax" };
         tax_id = data.id;
     }
-    return { value: { name, fee, tax_id, active: b?.active !== false } };
+    const description = pstr(b?.description, 200);
+    return {
+        value: {
+            name,
+            description: description || null,
+            fee,
+            tax_id,
+            active: b?.active !== false,
+        },
+    };
 }
 
 app.get("/rate-card", async (req, res) => {
     try {
-        const [svc, tax] = await Promise.all([
+        const [svc, tax, bun] = await Promise.all([
             supabase
                 .from("services")
-                .select("id, name, fee, tax_id, active")
+                .select("id, name, description, fee, tax_id, active")
                 .eq("owner_id", req.userId)
                 .order("name"),
             supabase
@@ -2070,13 +2080,52 @@ app.get("/rate-card", async (req, res) => {
                 .select("id, name, rate")
                 .eq("owner_id", req.userId)
                 .order("name"),
+            supabase
+                .from("bundles")
+                .select(
+                    "id, name, description, active, bundle_items(service_id, qty, position)",
+                )
+                .eq("owner_id", req.userId)
+                .order("name"),
         ]);
         if (svc.error) throw svc.error;
         if (tax.error) throw tax.error;
-        let services = svc.data.map((s) => ({ ...s, fee: Number(s.fee) }));
-        if (req.role === "staff") services = services.filter((s) => s.active);
+        if (bun.error) throw bun.error;
+
+        const all = svc.data.map((s) => ({ ...s, fee: Number(s.fee) }));
+        const byId = new Map(all.map((s) => [s.id, s]));
+        let bundles = bun.data.map((b) => ({
+            id: b.id,
+            name: b.name,
+            description: b.description,
+            active: b.active,
+            items: [...(b.bundle_items || [])]
+                .sort((a, z) => a.position - z.position)
+                .map((m) => {
+                    const s = byId.get(m.service_id);
+                    return s
+                        ? {
+                              service_id: s.id,
+                              qty: m.qty,
+                              name: s.name,
+                              description: s.description,
+                              fee: s.fee,
+                              tax_id: s.tax_id,
+                              active: s.active,
+                          }
+                        : null;
+                })
+                .filter(Boolean),
+        }));
+
+        let services = all;
+        if (req.role === "staff") {
+            services = all.filter((s) => s.active);
+            bundles = bundles.filter((b) => b.active && b.items.length);
+        }
         res.json({
             services,
+            bundles,
             taxes: tax.data.map((t) => ({ ...t, rate: Number(t.rate) })),
         });
     } catch (err) {
@@ -2167,7 +2216,7 @@ app.post("/services", async (req, res) => {
         const { data, error } = await supabase
             .from("services")
             .insert({ ...c.value, owner_id: req.userId })
-            .select("id, name, fee, tax_id, active")
+            .select("id, name, description, fee, tax_id, active")
             .single();
         if (error) {
             if (error.code === "23505")
@@ -2192,7 +2241,7 @@ app.put("/services/:id", async (req, res) => {
             .update(c.value)
             .eq("id", req.params.id)
             .eq("owner_id", req.userId)
-            .select("id, name, fee, tax_id, active")
+            .select("id, name, description, fee, tax_id, active")
             .maybeSingle();
         if (error) {
             if (error.code === "23505")
@@ -2211,6 +2260,21 @@ app.put("/services/:id", async (req, res) => {
 
 app.delete("/services/:id", async (req, res) => {
     try {
+        if (!UUID_RE.test(req.params.id))
+            return res.status(404).json({ error: "Not found" });
+        const { data: used, error: uErr } = await supabase
+            .from("bundle_items")
+            .select("bundles(name)")
+            .eq("service_id", req.params.id);
+        if (uErr) throw uErr;
+        if (used.length) {
+            const names = [
+                ...new Set(used.map((u) => u.bundles?.name).filter(Boolean)),
+            ];
+            return res.status(409).json({
+                error: `Used in bundle: ${names.join(", ")}. Remove it from the bundle first.`,
+            });
+        }
         const { error } = await supabase
             .from("services")
             .delete()
@@ -2240,20 +2304,69 @@ async function ownsPatient(id, owner) {
 }
 
 // Validates [{service_id, qty}]. Returns { value } or { error }.
-async function cleanItems(raw, owner, activeOnly) {
+// Validates services list. Catalog lines: {service_id, qty}.
+// One-off lines (doctor only): {adhoc:true, id, name, description, fee, qty, tax_id}.
+async function cleanItems(raw, owner, activeOnly, allowAdhoc = false) {
     if (!Array.isArray(raw) || raw.length > 50)
         return { error: "Invalid services" };
-    const map = new Map();
+
+    const out = [];
+    const idx = new Map(); // service_id -> position
+    const bidx = new Map(); // bundle_id -> position
     for (const r of raw) {
-        const id = String(r?.service_id || "");
         const qty = Number(r?.qty);
-        if (!UUID_RE.test(id)) return { error: "Invalid service" };
         if (!Number.isInteger(qty) || qty < 1 || qty > 99) {
             return { error: "Quantity must be 1 to 99" };
         }
-        map.set(id, qty);
+        if (r?.adhoc) {
+            if (!allowAdhoc)
+                return { error: "One-off services are not allowed here" };
+            const name = pstr(r.name, 80).replace(/\s+/g, " ");
+            if (name.length < 2)
+                return { error: "Enter a name for the one-off service" };
+            const fee = num2(r.fee, 0.01, 10000000);
+            if (fee === null)
+                return { error: "Enter a valid price for the one-off service" };
+            let tax_id = null;
+            if (r.tax_id) {
+                tax_id = String(r.tax_id);
+                if (!UUID_RE.test(tax_id))
+                    return { error: "Select a valid tax" };
+            }
+            out.push({
+                adhoc: true,
+                id: UUID_RE.test(String(r.id || ""))
+                    ? String(r.id)
+                    : randomUUID(),
+                name,
+                description: pstr(r.description, 200) || null,
+                fee,
+                qty,
+                tax_id,
+            });
+        } else if (r?.bundle_id) {
+            const bid = String(r.bundle_id);
+            if (!UUID_RE.test(bid)) return { error: "Invalid bundle" };
+            const mode = r.mode === "services" ? "services" : "named";
+            if (bidx.has(bid)) {
+                Object.assign(out[bidx.get(bid)], { qty, mode });
+            } else {
+                bidx.set(bid, out.length);
+                out.push({ bundle_id: bid, qty, mode });
+            }
+        } else {
+            const id = String(r?.service_id || "");
+            if (!UUID_RE.test(id)) return { error: "Invalid service" };
+            if (idx.has(id)) {
+                out[idx.get(id)].qty = qty;
+            } else {
+                idx.set(id, out.length);
+                out.push({ service_id: id, qty });
+            }
+        }
     }
-    const ids = [...map.keys()];
+
+    const ids = [...idx.keys()];
     if (ids.length) {
         const { data, error } = await supabase
             .from("services")
@@ -2266,7 +2379,36 @@ async function cleanItems(raw, owner, activeOnly) {
             return { error: "A selected service is not available" };
         }
     }
-    return { value: ids.map((id) => ({ service_id: id, qty: map.get(id) })) };
+
+    const bids = [...bidx.keys()];
+    if (bids.length) {
+        const { data, error } = await supabase
+            .from("bundles")
+            .select("id, active")
+            .eq("owner_id", owner)
+            .in("id", bids);
+        if (error) throw error;
+        if (data.length !== bids.length) return { error: "Unknown bundle" };
+        if (activeOnly && data.some((b) => !b.active)) {
+            return { error: "A selected bundle is not available" };
+        }
+    }
+
+    const taxIds = [
+        ...new Set(out.filter((i) => i.adhoc && i.tax_id).map((i) => i.tax_id)),
+    ];
+    if (taxIds.length) {
+        const { data, error } = await supabase
+            .from("tax_brackets")
+            .select("id")
+            .eq("owner_id", owner)
+            .in("id", taxIds);
+        if (error) throw error;
+        if (data.length !== taxIds.length)
+            return { error: "Select a valid tax" };
+    }
+
+    return { value: out };
 }
 
 // Drops expired rows, then returns live pending items for a patient
@@ -2278,14 +2420,22 @@ async function livePendingItems(patientId, owner, activeOnly) {
         .lt("created_at", pendingCutoff());
     const { data, error } = await supabase
         .from("patient_pending_services")
-        .select("service_id, qty, services(active)")
+        .select("service_id, bundle_id, qty, services(active), bundles(active)")
         .eq("owner_id", owner)
         .eq("patient_id", patientId)
         .order("created_at");
     if (error) throw error;
     return data
-        .filter((r) => !activeOnly || r.services?.active)
-        .map((r) => ({ service_id: r.service_id, qty: r.qty }));
+        .filter(
+            (r) =>
+                !activeOnly ||
+                (r.bundle_id ? r.bundles?.active : r.services?.active),
+        )
+        .map((r) =>
+            r.bundle_id
+                ? { bundle_id: r.bundle_id, qty: r.qty }
+                : { service_id: r.service_id, qty: r.qty },
+        );
 }
 
 app.get("/patients/:id/pending-services", async (req, res) => {
@@ -2330,7 +2480,8 @@ app.put("/patients/:id/pending-services", async (req, res) => {
                 c.value.map((i) => ({
                     owner_id: req.userId,
                     patient_id: id,
-                    service_id: i.service_id,
+                    service_id: i.service_id || null,
+                    bundle_id: i.bundle_id || null,
                     qty: i.qty,
                     added_by: req.actorId,
                 })),
@@ -2368,24 +2519,45 @@ app.get("/consultations/:id/services", async (req, res) => {
             Date.now() - PENDING_TTL_MS
         ) {
             items = await livePendingItems(c.patient_id, req.userId, false);
+            items = items.map((i) =>
+                i.bundle_id ? { ...i, mode: "named" } : i,
+            );
             source = "pending";
         }
 
-        // Drop services deleted since
-        const ids = items
+        // Drop catalog services deleted since. One-off lines stay.
+        // Drop catalog services and bundles deleted since. One-off lines stay.
+        const sids = items
+            .filter((i) => !i.adhoc && !i.bundle_id)
             .map((i) => i.service_id)
             .filter((x) => UUID_RE.test(x));
-        if (ids.length) {
-            const { data: found } = await supabase
+        const bids = items
+            .filter((i) => i.bundle_id)
+            .map((i) => i.bundle_id)
+            .filter((x) => UUID_RE.test(x));
+        let okS = new Set();
+        let okB = new Set();
+        if (sids.length) {
+            const { data: f } = await supabase
                 .from("services")
                 .select("id")
                 .eq("owner_id", req.userId)
-                .in("id", ids);
-            const ok = new Set((found || []).map((s) => s.id));
-            items = items.filter((i) => ok.has(i.service_id));
-        } else {
-            items = [];
+                .in("id", sids);
+            okS = new Set((f || []).map((s) => s.id));
         }
+        if (bids.length) {
+            const { data: f } = await supabase
+                .from("bundles")
+                .select("id")
+                .eq("owner_id", req.userId)
+                .in("id", bids);
+            okB = new Set((f || []).map((b) => b.id));
+        }
+        items = items.filter(
+            (i) =>
+                i.adhoc ||
+                (i.bundle_id ? okB.has(i.bundle_id) : okS.has(i.service_id)),
+        );
         res.json({ items, source });
     } catch (err) {
         console.log("⚠️ Consultation services load failed:", err.message);
@@ -2407,7 +2579,7 @@ app.put("/consultations/:id/services", async (req, res) => {
         if (error) throw error;
         if (!c) return res.status(404).json({ error: "Not found" });
 
-        const v = await cleanItems(req.body?.items, req.userId, false);
+        const v = await cleanItems(req.body?.items, req.userId, false, true);
         if (v.error) return res.status(400).json({ error: v.error });
 
         const up = await supabase
@@ -2480,16 +2652,63 @@ async function buildBillData(consultationId, owner) {
     if (saved.length === 0)
         return { error: "Save services on this consultation first" };
 
-    const ids = saved.map((i) => i.service_id).filter((x) => UUID_RE.test(x));
-    const { data: svcs, error: sErr } = await supabase
-        .from("services")
-        .select("id, name, fee, tax_id")
-        .eq("owner_id", owner)
-        .in("id", ids);
-    if (sErr) throw sErr;
+    // Bundles and their members
+    const bundleIds = saved
+        .filter((i) => i.bundle_id)
+        .map((i) => i.bundle_id)
+        .filter((x) => UUID_RE.test(x));
+    let bundleMap = new Map();
+    const membersByBundle = new Map();
+    if (bundleIds.length) {
+        const { data: bs, error: bErr } = await supabase
+            .from("bundles")
+            .select("id, name, description")
+            .eq("owner_id", owner)
+            .in("id", bundleIds);
+        if (bErr) throw bErr;
+        bundleMap = new Map(bs.map((b) => [b.id, b]));
+        const { data: bi, error: biErr } = await supabase
+            .from("bundle_items")
+            .select("bundle_id, service_id, qty, position")
+            .in("bundle_id", bundleIds)
+            .order("position");
+        if (biErr) throw biErr;
+        for (const m of bi) {
+            const arr = membersByBundle.get(m.bundle_id) || [];
+            arr.push(m);
+            membersByBundle.set(m.bundle_id, arr);
+        }
+    }
+
+    // Every service we need: catalog lines plus bundle members
+    const svcIds = new Set(
+        saved
+            .filter((i) => !i.adhoc && !i.bundle_id)
+            .map((i) => i.service_id)
+            .filter((x) => UUID_RE.test(x)),
+    );
+    for (const arr of membersByBundle.values())
+        arr.forEach((m) => svcIds.add(m.service_id));
+    let svcs = [];
+    if (svcIds.size) {
+        const { data, error: sErr } = await supabase
+            .from("services")
+            .select("id, name, description, fee, tax_id")
+            .eq("owner_id", owner)
+            .in("id", [...svcIds]);
+        if (sErr) throw sErr;
+        svcs = data;
+    }
     const svcMap = new Map(svcs.map((s) => [s.id, s]));
 
-    const taxIds = [...new Set(svcs.map((s) => s.tax_id).filter(Boolean))];
+    const taxIds = [
+        ...new Set(
+            [
+                ...svcs.map((s) => s.tax_id),
+                ...saved.filter((i) => i.adhoc).map((i) => i.tax_id),
+            ].filter((x) => x && UUID_RE.test(x)),
+        ),
+    ];
     let taxMap = new Map();
     if (taxIds.length) {
         const { data: taxes, error: tErr } = await supabase
@@ -2505,28 +2724,14 @@ async function buildBillData(consultationId, owner) {
     const groups = new Map();
     let subtotal = 0;
     let taxTotal = 0;
-    for (const it of saved) {
-        const s = svcMap.get(it.service_id);
-        if (!s) continue;
-        const t = taxMap.get(s.tax_id);
-        const fee = Number(s.fee);
+
+    // One priced line. Adds to the bill totals and tax groups.
+    const lineFor = (src, qty) => {
+        const t = taxMap.get(src.tax_id); // deleted tax: no tax
+        const fee = Number(src.fee);
         const rate = t ? Number(t.rate) : 0;
-        const qty = Number(it.qty);
         const base = r2(fee * qty);
         const tax = r2((base * rate) / 100);
-        items.push({
-            service_id: s.id,
-            name: s.name,
-            fee,
-            qty,
-            tax_name: t ? t.name : null,
-            tax_rate: rate,
-            base,
-            tax,
-            total: r2(base + tax),
-        });
-        subtotal += base;
-        taxTotal += tax;
         if (t) {
             const key = `${t.name}|${rate}`;
             const g = groups.get(key) || {
@@ -2539,6 +2744,77 @@ async function buildBillData(consultationId, owner) {
             g.tax = r2(g.tax + tax);
             groups.set(key, g);
         }
+        subtotal += base;
+        taxTotal += tax;
+        return {
+            name: src.name,
+            description: src.description || null,
+            fee,
+            qty,
+            tax_name: t ? t.name : null,
+            tax_rate: rate,
+            base,
+            tax,
+            total: r2(base + tax),
+        };
+    };
+
+    for (const it of saved) {
+        const qty = Number(it.qty);
+
+        if (it.bundle_id) {
+            const b = bundleMap.get(it.bundle_id);
+            const members = membersByBundle.get(it.bundle_id) || [];
+            if (!b || members.length === 0) continue;
+            const lines = [];
+            let unit = 0;
+            for (const m of members) {
+                const s = svcMap.get(m.service_id);
+                if (!s) continue;
+                unit = r2(unit + Number(s.fee) * m.qty);
+                lines.push({
+                    service_id: s.id,
+                    member_qty: m.qty,
+                    ...lineFor(s, m.qty * qty),
+                });
+            }
+            if (!lines.length) continue;
+            items.push({
+                type: "bundle",
+                mode: it.mode === "services" ? "services" : "named",
+                bundle_id: b.id,
+                name: b.name,
+                description: b.description || null,
+                qty,
+                unit_base: unit,
+                lines,
+                base: r2(lines.reduce((a, l) => a + l.base, 0)),
+                tax: r2(lines.reduce((a, l) => a + l.tax, 0)),
+                total: r2(lines.reduce((a, l) => a + l.total, 0)),
+            });
+            continue;
+        }
+
+        if (it.adhoc) {
+            items.push({
+                service_id: null,
+                adhoc: true,
+                ...lineFor(
+                    {
+                        name: it.name,
+                        description: it.description,
+                        fee: it.fee,
+                        tax_id: it.tax_id,
+                    },
+                    qty,
+                ),
+            });
+            continue;
+        }
+
+        const s = svcMap.get(it.service_id);
+        if (!s) continue;
+        items.push({ service_id: s.id, adhoc: false, ...lineFor(s, qty) });
     }
     if (!items.length) return { error: "Selected services no longer exist" };
 
@@ -2575,7 +2851,6 @@ async function buildBillData(consultationId, owner) {
         },
     };
 }
-
 async function insertBill(owner, consultationId, v) {
     const base = `INV-${istDate()}-${nameSlug(v.patient.name)}`;
     for (let n = 1; n <= 25; n++) {
@@ -2714,6 +2989,134 @@ app.put("/doctor/bill-letterhead", async (req, res) => {
     } catch (err) {
         console.log("⚠️ Bill letterhead save failed:", err.message);
         res.status(500).json({ error: "Failed to save bill letterhead" });
+    }
+});
+async function cleanBundle(b, owner) {
+    const name = pstr(b?.name, 80).replace(/\s+/g, " ");
+    if (name.length < 2) return { error: "Enter a bundle name" };
+    const description = pstr(b?.description, 200) || null;
+    const raw = Array.isArray(b?.items) ? b.items : [];
+    if (raw.length < 1)
+        return { error: "Add at least one service to the bundle" };
+    if (raw.length > 30)
+        return { error: "A bundle can hold up to 30 services" };
+
+    const items = [];
+    const seen = new Set();
+    for (const r of raw) {
+        const id = String(r?.service_id || "");
+        const qty = Number(r?.qty);
+        if (!UUID_RE.test(id)) return { error: "Invalid service" };
+        if (!Number.isInteger(qty) || qty < 1 || qty > 99) {
+            return { error: "Quantity must be 1 to 99" };
+        }
+        if (seen.has(id))
+            return { error: "A service appears twice in this bundle" };
+        seen.add(id);
+        items.push({ service_id: id, qty, position: items.length });
+    }
+    const { data, error } = await supabase
+        .from("services")
+        .select("id")
+        .eq("owner_id", owner)
+        .in("id", [...seen]);
+    if (error) throw error;
+    if (data.length !== seen.size) return { error: "Unknown service" };
+    return { value: { name, description, active: b?.active !== false, items } };
+}
+
+app.post("/bundles", async (req, res) => {
+    try {
+        const c = await cleanBundle(req.body, req.userId);
+        if (c.error) return res.status(400).json({ error: c.error });
+        const { items, ...fields } = c.value;
+        const { data: bundle, error } = await supabase
+            .from("bundles")
+            .insert({ ...fields, owner_id: req.userId })
+            .select("id")
+            .single();
+        if (error) {
+            if (error.code === "23505")
+                return res
+                    .status(409)
+                    .json({ error: "A bundle with this name exists" });
+            throw error;
+        }
+        const ins = await supabase
+            .from("bundle_items")
+            .insert(items.map((i) => ({ ...i, bundle_id: bundle.id })));
+        if (ins.error) {
+            await supabase.from("bundles").delete().eq("id", bundle.id); // roll back
+            throw ins.error;
+        }
+        res.status(201).json({ id: bundle.id });
+    } catch (err) {
+        console.log("⚠️ Bundle create failed:", err.message);
+        res.status(500).json({ error: "Failed to save bundle" });
+    }
+});
+
+app.put("/bundles/:id", async (req, res) => {
+    try {
+        if (!UUID_RE.test(req.params.id))
+            return res.status(404).json({ error: "Not found" });
+        const c = await cleanBundle(req.body, req.userId);
+        if (c.error) return res.status(400).json({ error: c.error });
+        const { items, ...fields } = c.value;
+        const { data: b, error } = await supabase
+            .from("bundles")
+            .update(fields)
+            .eq("id", req.params.id)
+            .eq("owner_id", req.userId)
+            .select("id")
+            .maybeSingle();
+        if (error) {
+            if (error.code === "23505")
+                return res
+                    .status(409)
+                    .json({ error: "A bundle with this name exists" });
+            throw error;
+        }
+        if (!b) return res.status(404).json({ error: "Not found" });
+
+        const up = await supabase.from("bundle_items").upsert(
+            items.map((i) => ({ ...i, bundle_id: b.id })),
+            {
+                onConflict: "bundle_id,service_id",
+            },
+        );
+        if (up.error) throw up.error;
+        const del = await supabase
+            .from("bundle_items")
+            .delete()
+            .eq("bundle_id", b.id)
+            .not(
+                "service_id",
+                "in",
+                `(${items.map((i) => i.service_id).join(",")})`,
+            );
+        if (del.error) throw del.error;
+        res.json({ id: b.id });
+    } catch (err) {
+        console.log("⚠️ Bundle update failed:", err.message);
+        res.status(500).json({ error: "Failed to save bundle" });
+    }
+});
+
+app.delete("/bundles/:id", async (req, res) => {
+    try {
+        if (!UUID_RE.test(req.params.id))
+            return res.status(404).json({ error: "Not found" });
+        const { error } = await supabase
+            .from("bundles")
+            .delete()
+            .eq("id", req.params.id)
+            .eq("owner_id", req.userId);
+        if (error) throw error;
+        res.json({ ok: true });
+    } catch (err) {
+        console.log("⚠️ Bundle delete failed:", err.message);
+        res.status(500).json({ error: "Failed to delete bundle" });
     }
 });
 const PORT = process.env.PORT || 8000;
