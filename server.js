@@ -1824,7 +1824,7 @@ function ageFromDob(dob) {
         now.getMonth() + 1 < +m[2] ||
         (now.getMonth() + 1 === +m[2] && now.getDate() < +m[3]);
     if (before) age--;
-    return age >= 0 ? age : null;
+    return age >= 0 ? age : age === -1 ? 0 : null;
 }
 const withAge = (p) =>
     p ? { ...p, age: p.dob ? ageFromDob(p.dob) : p.age } : p;
@@ -1840,9 +1840,14 @@ function parseDob(v) {
     ) {
         return { error: "Enter a valid date of birth" };
     }
+    // One day of slack for the time zone gap between the phone and the server
+    const limit = new Date(Date.now() + 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10);
+    if (s > limit) return { error: "Date of birth can't be in the future" };
     const age = ageFromDob(s);
-    if (age === null) return { error: "Date of birth can't be in the future" };
-    if (age > 120) return { error: "Enter a valid date of birth" };
+    if (age !== null && age > 120)
+        return { error: "Enter a valid date of birth" };
     return { value: s };
 }
 
