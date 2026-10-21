@@ -690,6 +690,239 @@ async function afterConsultationEdit(consultationId, sd) {
 
     return updated;
 }
+function parseModelJson(text) {
+    const s = String(text || "")
+        .replace(/```json/gi, "")
+        .replace(/```/g, "")
+        .trim();
+    const a = s.indexOf("{");
+    const b = s.lastIndexOf("}");
+    if (a === -1 || b <= a) return null;
+    try {
+        const obj = JSON.parse(s.slice(a, b + 1));
+        return obj && typeof obj === "object" && !Array.isArray(obj)
+            ? obj
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+const EXPECTED_KEYS = [
+    "consultation_summary",
+    "prescription",
+    "conditions",
+    "vitals",
+    "allergies",
+    "system_review",
+];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// First try plus two retries. Throws if none gives usable JSON.
+async function extractStructured(basePrompt, images) {
+    const MAX_ATTEMPTS = 3;
+    let lastErr = new Error("No attempt made");
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        try {
+            const payload = {
+                model: "gemma4:31b-cloud",
+                prompt:
+                    attempt === 0
+                        ? basePrompt
+                        : `${basePrompt}\n\nIMPORTANT: Your previous reply could not be read. Reply with exactly one valid JSON object that follows the template. No text before or after it.`,
+                images,
+                stream: false,
+            };
+            // Retries ask Ollama for strict JSON. I have not confirmed this model honors it.
+            // If retries start failing with a 400, delete the next line.
+            if (attempt > 0) payload.format = "json";
+
+            const r = await axios.post(
+                "https://ollama.com/api/generate",
+                payload,
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
+                    },
+                    timeout: 180000,
+                },
+            );
+            const obj = parseModelJson(r.data?.response);
+            if (obj && EXPECTED_KEYS.some((k) => k in obj)) return obj;
+            lastErr = new Error("The model reply was not usable JSON");
+        } catch (err) {
+            lastErr = err;
+        }
+        console.log(
+            `⚠️ Summary attempt ${attempt + 1}/${MAX_ATTEMPTS} failed:`,
+            lastErr.message,
+        );
+        if (attempt < MAX_ATTEMPTS - 1) await sleep(700 * (attempt + 1));
+    }
+    throw lastErr;
+}
+const HISTORY_LABELS = {
+    diabetes: "Diabetes mellitus",
+    hypertension: "Hypertension",
+    hypothyroidism: "Hypothyroidism",
+    alcohol: "Alcohol",
+    tobacco: "Tobacco",
+    smoke: "Smoking",
+};
+
+// Registration record as context. No name, phone or address.
+function patientContext(p) {
+    if (!p) return "";
+    const lines = [];
+    const age = ageFromDob(p.dob) ?? p.age;
+    if (age != null) lines.push(`Age: ${age}`);
+    if (p.gender) lines.push(`Gender: ${p.gender}`);
+    if (p.occupation) lines.push(`Occupation: ${p.occupation}`);
+    const m = p.medical && typeof p.medical === "object" ? p.medical : {};
+    if (m.blood_group) lines.push(`Blood group: ${m.blood_group}`);
+    if (m.no_known_history)
+        lines.push("Reported no known medical history at registration");
+    for (const [k, label] of Object.entries(HISTORY_LABELS)) {
+        if (m[k]) lines.push(`${label}: ${m[k]}`);
+    }
+    return lines.join("\n");
+}
+
+function suggestionContext(sd) {
+    const j = (arr, f) =>
+        Array.isArray(arr) ? arr.map(f).filter(Boolean).join("; ") : "";
+    const lines = [];
+    const add = (label, text) => text && lines.push(`${label}: ${text}`);
+    add(
+        "Symptoms",
+        j(sd.prescription?.symptoms, (e) => e?.name),
+    );
+    add(
+        "Allergies noted in this visit",
+        j(sd.allergies, (e) => e?.name),
+    );
+    add(
+        "Known conditions",
+        j(sd.conditions, (e) => e?.name),
+    );
+    add(
+        "Current medicines",
+        j(
+            sd.medication_history,
+            (e) => e?.name && `${e.name}${e.dosage ? ` ${e.dosage}` : ""}`,
+        ),
+    );
+    add(
+        "Vitals",
+        j(sd.vitals, (v) => v?.value && `${v.name} ${v.value}${v.units || ""}`),
+    );
+    return lines.join("\n");
+}
+
+function cleanSuggestion(obj) {
+    if (!obj || typeof obj !== "object") return null;
+    const list = (v, max) => (Array.isArray(v) ? v.slice(0, max) : []);
+    const items = [];
+    let n = 0;
+    const nid = (k) => `${k}${++n}`;
+
+    for (const m of list(obj.medications, 8)) {
+        const name = pstr(m?.name, 120);
+        if (!name) continue;
+        const dosage = (Array.isArray(m?.dosage) ? m.dosage : [m?.dosage])
+            .map((x) => pstr(x, 80))
+            .filter(Boolean)
+            .slice(0, 6);
+        items.push({
+            id: nid("m"),
+            kind: "medication",
+            name,
+            dosage,
+            duration: pstr(m?.duration, 60),
+            instructions: pstr(m?.instructions, 200),
+            rationale: pstr(m?.rationale, 200),
+        });
+    }
+    for (const d of list(obj.diagnosis, 3)) {
+        const name = pstr(d?.name, 120);
+        if (name)
+            items.push({
+                id: nid("d"),
+                kind: "diagnosis",
+                name,
+                rationale: pstr(d?.rationale, 200),
+            });
+    }
+    for (const f of list(obj.followup, 1)) {
+        const when = pstr(f?.next_visit_duration, 60);
+        const advice = pstr(f?.advice, 300);
+        if (when || advice) {
+            items.push({
+                id: nid("f"),
+                kind: "followup",
+                name: when || "Follow up",
+                next_visit_duration: when,
+                date: "",
+                advice,
+            });
+        }
+    }
+    if (!items.length) return null;
+    return {
+        status: "pending",
+        generated_at: new Date().toISOString(),
+        items,
+        note: pstr(obj.note, 300),
+    };
+}
+// Returns a suggested plan or null. Never throws.
+async function generateSuggestion({ transcript, patient, sd }) {
+    try {
+        if (!transcript || transcript.length < 40) return null;
+        const ctx = [patientContext(patient), suggestionContext(sd || {})]
+            .filter(Boolean)
+            .join("\n");
+        const base = fs
+            .readFileSync("suggested-plan-prompt.md", "utf-8")
+            .replace("{{patient_context}}", () => ctx || "None recorded")
+            .replace("{{transcript}}", () => transcript);
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                const payload = {
+                    model: "gemma4:31b-cloud",
+                    prompt:
+                        attempt === 0
+                            ? base
+                            : `${base}\n\nIMPORTANT: Your previous reply could not be read. Reply with exactly one valid JSON object. Nothing else.`,
+                    stream: false,
+                };
+                if (attempt > 0) payload.format = "json"; // unconfirmed for this model. Delete if it causes a 400.
+                const r = await axios.post(
+                    "https://ollama.com/api/generate",
+                    payload,
+                    {
+                        headers: {
+                            Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
+                        },
+                        timeout: 90000,
+                    },
+                );
+                const plan = cleanSuggestion(parseModelJson(r.data?.response));
+                if (plan) return plan;
+            } catch (err) {
+                console.log(
+                    `⚠️ Suggestion attempt ${attempt + 1} failed:`,
+                    err.message,
+                );
+            }
+        }
+        return null;
+    } catch (err) {
+        console.log("⚠️ Suggestion failed:", err.message);
+        return null;
+    }
+}
 app.post(
     "/process-audio",
     upload.fields([
@@ -698,339 +931,202 @@ app.post(
     ]),
     async (req, res) => {
         const startTime = Date.now();
+        const audioFile = req.files?.file?.[0];
+        const attachmentFiles = req.files?.attachments || [];
+        const cleanupFiles = () =>
+            [audioFile, ...attachmentFiles]
+                .filter(Boolean)
+                .forEach((f) => fs.unlink(f.path, () => {}));
 
-        console.log("\n========================================");
-        console.log("🚀 /process-audio request received");
-        console.log("========================================");
+        const body = req.body || {};
+        const patientId = String(body.patient_id || "").trim();
+        const sttProvider = String(
+            body.stt_provider || "whisper",
+        ).toLowerCase();
+
+        // A retry sends the transcript back instead of the audio
+        let transcript =
+            typeof body.transcript === "string"
+                ? body.transcript.trim().slice(0, 300000)
+                : "";
+        let diarized =
+            typeof body.diarized_transcript === "string"
+                ? body.diarized_transcript.slice(0, 300000)
+                : null;
+        let language = String(body.language || "unknown").slice(0, 20);
+        const fromTranscript = transcript.length > 0;
+
+        // Failure reply. Carries the transcript when there is one, so Retry can reuse it.
+        const fail = (stage, status = 502) =>
+            res.status(status).json({
+                error: "generation_failed",
+                stage,
+                transcript: transcript || null,
+                diarizedTranscript: diarized || null,
+                language,
+            });
+
+        console.log("\n🚀 /process-audio", {
+            audio: !!audioFile,
+            attachments: attachmentFiles.length,
+            fromTranscript,
+        });
 
         try {
-            const audioFile = req.files?.file?.[0];
-            const attachmentFiles = req.files?.attachments || [];
-
-            if (!audioFile && attachmentFiles.length === 0) {
-                console.log("❌ No file received");
+            if (!audioFile && attachmentFiles.length === 0 && !fromTranscript) {
                 return res
                     .status(400)
                     .json({ error: "No audio file or documents uploaded" });
             }
-            console.log("📁 File received:");
-            if (audioFile) {
-                console.log("   Original name:", audioFile.originalname);
-                console.log("   Saved path:", audioFile.path);
-                console.log("   Size:", audioFile.size, "bytes");
-                console.log("   MIME type:", audioFile.mimetype);
-            } else {
-                console.log("   No audio file — processing attachments only");
-            }
-            if (attachmentFiles.length > 0) {
-                console.log(`   Attachments: ${attachmentFiles.length}`);
-                attachmentFiles.forEach((f) =>
-                    console.log("     -", f.originalname, f.mimetype),
-                );
-            }
-            const patientId = (req.body.patient_id || "").trim() || null;
-            const patientName = (req.body.patient_name || "").trim();
-            const patientPhone = (req.body.patient_phone || "").trim();
-            const patientAge = req.body.patient_age
-                ? parseInt(req.body.patient_age, 10)
-                : null;
-            const patientGender = req.body.patient_gender || null;
-            const sttProvider = (
-                req.body.stt_provider || "whisper"
-            ).toLowerCase();
-            if (!patientId && (!patientName || !patientPhone)) {
-                return res.status(400).json({
-                    error: "Select an existing patient, or provide a name and phone number for a new one",
-                });
-            }
-            async function runPipeline(
-                transcript,
-                language,
-                diarizedTranscript,
-            ) {
-                console.log("\n📝 Transcript:");
-                console.log(transcript);
-
-                if (diarizedTranscript) {
-                    console.log("\n🗣️ Diarized Transcript:");
-                    console.log(diarizedTranscript);
-                }
-
-                console.log("\n📄 Loading template.json...");
-                const template = fs.readFileSync("template.json", "utf-8");
-
-                console.log("📄 Loading prompt.txt...");
-                let prompt = fs.readFileSync("prompt.md", "utf-8");
-                prompt = prompt
-                    .replace("{{template}}", template)
-                    .replace("{{transcript}}", transcript);
-
-                console.log("✅ Prompt prepared");
-                console.log("Prompt length:", prompt.length);
-
-                console.log("\n📎 Reading attachments...");
-                let attachmentImages = [];
-                for (const file of attachmentFiles) {
-                    try {
-                        const imgs = await attachmentToImages(file);
-                        attachmentImages = attachmentImages.concat(imgs);
-                    } catch (err) {
-                        console.log(
-                            `⚠️ Failed to read ${file.originalname}:`,
-                            err.message,
-                        );
-                    } finally {
-                        fs.unlink(file.path, () => {});
-                    }
-                }
-
-                console.log("\n🤖 Calling Ollama...");
-                console.log("Model: gemma4:31b-cloud");
-                const ollamaStart = Date.now();
-
-                try {
-                    const ollamaResponse = await axios.post(
-                        "https://ollama.com/api/generate",
-                        {
-                            model: "gemma4:31b-cloud",
-                            prompt: prompt,
-                            images: attachmentImages,
-                            stream: false,
-                        },
-                        {
-                            headers: {
-                                Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
-                            },
-                        },
-                    );
-
-                    console.log(
-                        `🤖 Ollama completed in ${(Date.now() - ollamaStart) / 1000} seconds`,
-                    );
-
-                    let structuredData;
-                    try {
-                        let rawResponse = ollamaResponse.data.response.trim();
-                        rawResponse = rawResponse
-                            .replace(/```json/g, "")
-                            .replace(/```/g, "")
-                            .trim();
-                        if (!rawResponse.startsWith("{"))
-                            throw new Error("Invalid JSON response");
-                        structuredData = JSON.parse(rawResponse);
-                        console.log("✅ Ollama response parsed as JSON");
-                        console.log(structuredData);
-                    } catch (err) {
-                        console.log(
-                            "⚠️ Ollama response is not valid JSON, returning raw response.",
-                        );
-                        structuredData = {
-                            raw_response: ollamaResponse.data.response,
-                        };
-                    }
-
-                    console.log("\n========================================");
-                    console.log("✅ PROCESS COMPLETE");
-                    console.log(
-                        "⏱️ Total time:",
-                        (Date.now() - startTime) / 1000,
-                        "seconds",
-                    );
-                    console.log("========================================\n");
-
-                    if (structuredData && !structuredData.raw_response) {
-                        console.log("\n🔎 Verifying codes against UMLS...");
-                        try {
-                            structuredData =
-                                await verifyAllCodes(structuredData);
-                            console.log("✅ Code verification complete");
-                        } catch (err) {
-                            console.log(
-                                "⚠️ UMLS verification step failed, returning unverified codes:",
-                                err.message,
-                            );
-                        }
-                    }
-                    console.log("\n💾 Resolving patient...");
-                    let patient = null;
-                    try {
-                        if (patientId) {
-                            // existing patient: must belong to this user
-                            const { data, error } = await supabase
-                                .from("patients")
-                                .select()
-                                .eq("id", patientId)
-                                .eq("owner_id", req.userId)
-                                .single();
-                            if (error) throw error;
-                            patient = data;
-                        } else {
-                            const { data, error } = await supabase
-                                .from("patients")
-                                // new patient: stamp the owner
-                                .insert({
-                                    name: patientName,
-                                    age: patientAge,
-                                    gender: patientGender,
-                                    phone: patientPhone,
-                                    owner_id: req.userId,
-                                })
-                                .select()
-                                .single();
-
-                            if (error) {
-                                if (error.code === "23505") {
-                                    // Phone already exists — someone raced us, or the search missed it. Use the existing record.
-                                    console.log(
-                                        "⚠️ Phone already registered, using existing patient",
-                                    );
-                                    const { data: existing, error: fetchErr } =
-                                        await supabase
-                                            .from("patients")
-                                            // duplicate-phone fallback: look up within this user's patients only
-                                            .select()
-                                            .eq("phone", patientPhone)
-                                            .eq("owner_id", req.userId)
-                                            .single();
-                                    if (fetchErr) throw fetchErr;
-                                    patient = existing;
-                                } else {
-                                    throw error;
-                                }
-                            } else {
-                                patient = data;
-                            }
-                        }
-                    } catch (err) {
-                        console.log(
-                            "⚠️ Patient resolution failed:",
-                            err.message,
-                        );
-                    }
-
-                    let savedRecord = null;
-                    let createdAt = null;
-                    if (patient) {
-                        try {
-                            const {
-                                data: consultation,
-                                error: consultationError,
-                            } = await supabase
-                                .from("consultations")
-                                // consultation insert
-                                .insert({
-                                    patient_id: patient.id,
-                                    owner_id: req.userId,
-                                    language,
-                                    transcript,
-                                    diarized_transcript:
-                                        diarizedTranscript || null,
-                                    structured_data: structuredData,
-                                })
-                                .select()
-                                .single();
-                            if (consultationError) throw consultationError;
-                            createdAt = consultation.created_at;
-
-                            savedRecord = {
-                                patient_id: patient.id,
-                                patient_name: patient.name,
-                                patient_age:
-                                    ageFromDob(patient.dob) ?? patient.age,
-                                patient_gender: patient.gender,
-                                patient_phone: patient.phone,
-                                consultation_id: consultation.id,
-                            };
-                            console.log("✅ Saved:", savedRecord);
-
-                            regeneratePatientSummary(patient.id).catch((err) =>
-                                console.log(
-                                    "⚠️ Patient summary regeneration failed:",
-                                    err.message,
-                                ),
-                            );
-                        } catch (err) {
-                            console.log(
-                                "⚠️ Consultation save failed:",
-                                err.message,
-                            );
-                        }
-                    }
-
-                    res.json({
-                        language,
-                        transcript,
-                        diarizedTranscript: diarizedTranscript || null,
-                        structured_data: structuredData,
-                        created_at: createdAt,
-                        saved: savedRecord,
-                    });
-                } catch (ollamaError) {
-                    console.log(
-                        "\n❌ PIPELINE ERROR (Ollama call or post-processing)",
-                    );
-                    if (ollamaError.response) {
-                        console.log("Status:", ollamaError.response.status);
-                        console.log("Response:", ollamaError.response.data);
-                    } else {
-                        console.log(ollamaError.message);
-                    }
-                    return res.status(500).json({
-                        error: "Ollama request failed",
-                        details: ollamaError.message,
-                    });
-                }
+            if (!UUID_RE.test(patientId)) {
+                return res
+                    .status(400)
+                    .json({ error: "Select a patient first" });
             }
 
-            if (audioFile) {
-                const providerLabels = {
-                    sarvam: "Sarvam",
-                    elevenlabs: "ElevenLabs Scribe",
-                    whisper: "Groq Whisper",
+            // Cheap check first: patient must exist and belong to this doctor
+            const { data: patient, error: patientError } = await supabase
+                .from("patients")
+                .select()
+                .eq("id", patientId)
+                .eq("owner_id", req.userId)
+                .maybeSingle();
+            if (patientError) throw patientError;
+            if (!patient)
+                return res.status(404).json({ error: "Patient not found" });
+
+            // ---- 1. Transcribe (skipped on a transcript retry) ----
+            if (audioFile && !fromTranscript) {
+                const fns = {
+                    sarvam: transcribeWithSarvam,
+                    elevenlabs: transcribeWithElevenLabs,
                 };
-                const providerLabel =
-                    providerLabels[sttProvider] || "Groq Whisper";
-                console.log(`\n🎙️ Transcribing via ${providerLabel}...`);
+                const transcribeFn = fns[sttProvider] || transcribeWithGroq;
                 try {
-                    const transcribeFns = {
-                        sarvam: transcribeWithSarvam,
-                        elevenlabs: transcribeWithElevenLabs,
-                    };
-                    const transcribeFn =
-                        transcribeFns[sttProvider] || transcribeWithGroq;
-                    const { transcript, language, diarizedTranscript } =
-                        await transcribeFn(
-                            audioFile.path,
-                            audioFile.originalname,
-                            audioFile.mimetype,
-                        );
-                    await runPipeline(transcript, language, diarizedTranscript);
+                    const out = await transcribeFn(
+                        audioFile.path,
+                        audioFile.originalname,
+                        audioFile.mimetype,
+                    );
+                    transcript = (out.transcript || "").trim();
+                    diarized = out.diarizedTranscript || null;
+                    language = out.language || "unknown";
                 } catch (err) {
                     console.log(
-                        `❌ ${providerLabel} transcription failed:`,
+                        "❌ Transcription failed:",
                         err.response?.data || err.message,
                     );
-                    return res.status(500).json({
-                        error: "Transcription failed",
-                        details:
-                            err.response?.data?.error?.message ||
-                            err.response?.data?.message ||
-                            err.message,
-                    });
-                } finally {
-                    fs.unlink(audioFile.path, () => {});
+                    return fail("transcribe");
                 }
-            } else {
-                console.log("\n🎙️ Skipping Whisper — no audio file provided");
-                await runPipeline("", "unknown");
             }
-        } catch (err) {
-            console.log("\n❌ SERVER ERROR");
-            console.log(err);
+            if (!transcript && attachmentFiles.length === 0)
+                return fail("transcribe");
 
-            res.status(500).json({
-                error: err.message,
+            // ---- 2. Build the prompt ----
+            const template = fs.readFileSync("template.json", "utf-8");
+            let prompt = fs
+                .readFileSync("prompt.md", "utf-8")
+                .replace("{{template}}", () => template)
+                .replace("{{transcript}}", () => transcript);
+
+            const regContext = patientContext(patient);
+            if (regContext) {
+                prompt += `\n\n# Patient registration record (context only)\nThis is background from registration. Use it to understand the visit. Do NOT copy any of it into the output unless the transcript itself mentions it.\n${regContext}\n`;
+            }
+            let attachmentImages = [];
+            for (const file of attachmentFiles) {
+                try {
+                    attachmentImages = attachmentImages.concat(
+                        await attachmentToImages(file),
+                    );
+                } catch (err) {
+                    console.log(
+                        `⚠️ Failed to read ${file.originalname}:`,
+                        err.message,
+                    );
+                }
+            }
+
+            // ---- 3. Summary, with automatic retries ----
+            let structuredData;
+            try {
+                structuredData = await extractStructured(
+                    prompt,
+                    attachmentImages,
+                );
+            } catch (err) {
+                console.log(
+                    "❌ Summary generation failed:",
+                    err.response?.data || err.message,
+                );
+                return fail("summarize");
+            }
+            // Runs while codes are verified. Capped at 60 seconds.
+            const planPromise = generateSuggestion({
+                transcript,
+                patient,
+                sd: structuredData,
             });
+            // ---- 4. Code verification. Never blocks. ----
+            try {
+                structuredData = await verifyAllCodes(structuredData);
+            } catch (err) {
+                console.log(
+                    "⚠️ UMLS verification failed, keeping unverified codes:",
+                    err.message,
+                );
+            }
+            const plan = await Promise.race([
+                planPromise,
+                sleep(60000).then(() => null),
+            ]);
+            if (plan) structuredData.suggested_plan = plan;
+            // ---- 5. Save ----
+            const { data: consultation, error: saveError } = await supabase
+                .from("consultations")
+                .insert({
+                    patient_id: patient.id,
+                    owner_id: req.userId,
+                    language,
+                    transcript,
+                    diarized_transcript: diarized || null,
+                    structured_data: structuredData,
+                })
+                .select()
+                .single();
+            if (saveError) {
+                console.log("❌ Consultation save failed:", saveError.message);
+                return fail("other", 500);
+            }
+
+            regeneratePatientSummary(patient.id).catch((err) =>
+                console.log(
+                    "⚠️ Patient summary regeneration failed:",
+                    err.message,
+                ),
+            );
+
+            console.log(`✅ Done in ${(Date.now() - startTime) / 1000}s`);
+            return res.json({
+                language,
+                transcript,
+                diarizedTranscript: diarized || null,
+                structured_data: structuredData,
+                created_at: consultation.created_at,
+                saved: {
+                    patient_id: patient.id,
+                    patient_name: patient.name,
+                    patient_age: ageFromDob(patient.dob) ?? patient.age,
+                    patient_gender: patient.gender,
+                    patient_phone: patient.phone,
+                    consultation_id: consultation.id,
+                },
+            });
+        } catch (err) {
+            console.log("❌ SERVER ERROR", err);
+            if (!res.headersSent) fail("other", 500);
+        } finally {
+            cleanupFiles();
         }
     },
 );
@@ -1292,6 +1388,7 @@ app.put("/consultations/:id/prescription", async (req, res) => {
 
         const cleaned = {};
         for (const key of Object.keys(RX_FIELDS)) {
+            if (!(key in incoming)) continue; // older screens do not send tests
             cleaned[key] = await sanitizeRxList(
                 key,
                 incoming[key],
@@ -3122,6 +3219,647 @@ app.delete("/bundles/:id", async (req, res) => {
     } catch (err) {
         console.log("⚠️ Bundle delete failed:", err.message);
         res.status(500).json({ error: "Failed to delete bundle" });
+    }
+});
+async function loadConsultationFull(id, owner) {
+    if (!UUID_RE.test(id)) return null;
+    const { data, error } = await supabase
+        .from("consultations")
+        .select("id, patient_id, transcript, structured_data")
+        .eq("id", id)
+        .eq("owner_id", owner)
+        .maybeSingle();
+    if (error) throw error;
+    return data;
+}
+const sdOf = (c) =>
+    c.structured_data && typeof c.structured_data === "object"
+        ? c.structured_data
+        : {};
+
+// Build a plan for an older consultation, or rebuild one
+app.post("/consultations/:id/suggestion", async (req, res) => {
+    try {
+        const c = await loadConsultationFull(req.params.id, req.userId);
+        if (!c) return res.status(404).json({ error: "Not found" });
+        const sd = sdOf(c);
+        if (sd.suggested_plan?.status === "approved") {
+            return res
+                .status(409)
+                .json({ error: "A suggestion was already added" });
+        }
+        const { data: patient } = await supabase
+            .from("patients")
+            .select()
+            .eq("id", c.patient_id)
+            .eq("owner_id", req.userId)
+            .maybeSingle();
+        const plan = await generateSuggestion({
+            transcript: c.transcript,
+            patient,
+            sd,
+        });
+        if (!plan) {
+            return res.status(502).json({
+                error: "Couldn't build a suggestion. Please try again.",
+            });
+        }
+        const { error } = await supabase
+            .from("consultations")
+            .update({ structured_data: { ...sd, suggested_plan: plan } })
+            .eq("id", c.id)
+            .eq("owner_id", req.userId);
+        if (error) throw error;
+        res.json({ suggested_plan: plan });
+    } catch (err) {
+        console.log("⚠️ Suggestion route failed:", err.message);
+        res.status(500).json({
+            error: "Couldn't build a suggestion. Please try again.",
+        });
+    }
+});
+
+// Dismiss or bring back
+app.put("/consultations/:id/suggestion", async (req, res) => {
+    try {
+        const status = req.body?.status;
+        if (!["dismissed", "pending"].includes(status)) {
+            return res.status(400).json({ error: "Invalid status" });
+        }
+        const c = await loadConsultationFull(req.params.id, req.userId);
+        if (!c) return res.status(404).json({ error: "Not found" });
+        const sd = sdOf(c);
+        if (!sd.suggested_plan)
+            return res.status(404).json({ error: "No suggestion" });
+        if (sd.suggested_plan.status === "approved") {
+            return res.status(409).json({ error: "Already added" });
+        }
+        const next = { ...sd.suggested_plan, status };
+        const { error } = await supabase
+            .from("consultations")
+            .update({ structured_data: { ...sd, suggested_plan: next } })
+            .eq("id", c.id)
+            .eq("owner_id", req.userId);
+        if (error) throw error;
+        res.json({ suggested_plan: next });
+    } catch (err) {
+        console.log("⚠️ Suggestion status failed:", err.message);
+        res.status(500).json({ error: "Failed to update" });
+    }
+});
+
+// Add ticked items to the prescription
+app.post("/consultations/:id/suggestion/approve", async (req, res) => {
+    try {
+        const c = await loadConsultationFull(req.params.id, req.userId);
+        if (!c) return res.status(404).json({ error: "Not found" });
+        const sd = sdOf(c);
+        const plan = sd.suggested_plan;
+        if (!plan || !Array.isArray(plan.items)) {
+            return res.status(400).json({ error: "No suggestion to add" });
+        }
+        if (plan.status === "approved")
+            return res.status(409).json({ error: "Already added" });
+
+        const ids = new Set(
+            Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [],
+        );
+        const picked = plan.items.filter((i) => ids.has(i.id));
+        if (!picked.length)
+            return res.status(400).json({ error: "Select at least one item" });
+
+        const rx =
+            sd.prescription && typeof sd.prescription === "object"
+                ? sd.prescription
+                : {};
+        const cur = (k) => (Array.isArray(rx[k]) ? rx[k] : []);
+        const low = (v) =>
+            String(v || "")
+                .trim()
+                .toLowerCase();
+        const seen = (list, name) =>
+            list.some((e) => low(e?.name) === low(name));
+
+        const next = {
+            medications: [...cur("medications")],
+            diagnosis: [...cur("diagnosis")],
+            followup: [...cur("followup")],
+        };
+        for (const it of picked) {
+            if (it.kind === "medication") {
+                if (!seen(next.medications, it.name)) {
+                    next.medications.push({
+                        name: it.name,
+                        duration: it.duration || "",
+                        dosage: Array.isArray(it.dosage) ? it.dosage : [],
+                        instructions: it.instructions || "",
+                    });
+                }
+            } else if (it.kind === "diagnosis") {
+                if (!seen(next.diagnosis, it.name))
+                    next.diagnosis.push({ name: it.name });
+            } else if (it.kind === "followup") {
+                const dup = next.followup.some(
+                    (e) =>
+                        low(e?.advice) === low(it.advice) &&
+                        low(e?.next_visit_duration) ===
+                            low(it.next_visit_duration),
+                );
+                if (!dup) {
+                    next.followup.push({
+                        next_visit_duration: it.next_visit_duration || "",
+                        date: "",
+                        advice: it.advice || "",
+                    });
+                }
+            }
+        }
+
+        // Same cleaning and code lookup your prescription editor uses
+        const cleaned = {};
+        for (const key of ["medications", "diagnosis", "followup"]) {
+            cleaned[key] = await sanitizeRxList(key, next[key], cur(key));
+        }
+        const updated = await afterConsultationEdit(c.id, {
+            ...sd,
+            prescription: { ...rx, ...cleaned },
+            suggested_plan: {
+                ...plan,
+                status: "approved",
+                approved_at: new Date().toISOString(),
+                approved_ids: [...ids],
+            },
+        });
+        res.json({
+            prescription: updated.prescription,
+            suggested_plan: updated.suggested_plan,
+            consultation_summary: updated.consultation_summary,
+        });
+    } catch (err) {
+        console.log("⚠️ Suggestion approve failed:", err.message);
+        res.status(500).json({ error: "Failed to add to the prescription" });
+    }
+});
+const voiceUpload = multer({
+    dest: "uploads/",
+    limits: { fileSize: 10 * 1024 * 1024 },
+});
+
+const istTodayLong = () =>
+    new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Asia/Kolkata",
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+    }).format(new Date());
+
+const vList = (v, max) => (Array.isArray(v) ? v.slice(0, max) : []);
+const vStr = (v, n) => pstr(typeof v === "string" ? v : "", n);
+
+// One entry per section that supports voice. D2 adds the history sections here.
+function cleanVoiceRx(obj) {
+    const out = { symptoms: [], medications: [], diagnosis: [], followup: [] };
+    for (const e of vList(obj?.symptoms, 15)) {
+        const name = vStr(e?.name, 120);
+        if (name)
+            out.symptoms.push({
+                name,
+                duration: vStr(e?.duration, 60),
+                notes: vStr(e?.notes, 300),
+            });
+    }
+    for (const e of vList(obj?.medications, 15)) {
+        const name = vStr(e?.name, 120);
+        if (!name) continue;
+        const dosage = (Array.isArray(e?.dosage) ? e.dosage : [e?.dosage])
+            .map((x) => vStr(x, 80))
+            .filter(Boolean)
+            .slice(0, 6);
+        out.medications.push({
+            name,
+            duration: vStr(e?.duration, 60),
+            dosage,
+            instructions: vStr(e?.instructions, 200),
+        });
+    }
+    for (const e of vList(obj?.diagnosis, 10)) {
+        const name = vStr(e?.name, 120);
+        if (name) out.diagnosis.push({ name });
+    }
+    for (const e of vList(obj?.followup, 3)) {
+        const row = {
+            next_visit_duration: vStr(e?.next_visit_duration, 60),
+            date: vStr(e?.date, 40),
+            advice: vStr(e?.advice, 300),
+        };
+        if (row.next_visit_duration || row.date || row.advice)
+            out.followup.push(row);
+    }
+    return out;
+}
+
+const VITAL_NAMES = [
+    "Systolic Blood Pressure",
+    "Diastolic Blood Pressure",
+    "Body Temperature",
+    "Respiration",
+    "Body Weight",
+    "Body Height",
+];
+const vitalName = (n) =>
+    VITAL_NAMES.find(
+        (x) =>
+            x.toLowerCase() ===
+            String(n || "")
+                .trim()
+                .toLowerCase(),
+    ) || null;
+const asText = (v) => (v === null || v === undefined ? "" : String(v));
+
+function cleanAllVoice(obj) {
+    const o = obj && typeof obj === "object" ? obj : {};
+    const strList = (v, n, max) =>
+        (Array.isArray(v)
+            ? v
+            : typeof v === "string" && v
+              ? v.split(/[,;]/)
+              : []
+        )
+            .map((x) => vStr(asText(x), n))
+            .filter(Boolean)
+            .slice(0, max);
+    const simple = (key, fields, max = 15) => {
+        const out = [];
+        for (const e of vList(o[key], max)) {
+            const row = {};
+            for (const [f, n] of fields) row[f] = vStr(asText(e?.[f]), n);
+            if (row.name) out.push(row);
+        }
+        return out;
+    };
+
+    const vitals = [];
+    const seen = new Set();
+    for (const e of vList(o.vitals, 12)) {
+        const name = vitalName(e?.name);
+        const value = vStr(asText(e?.value), 30);
+        if (name && value && !seen.has(name)) {
+            seen.add(name);
+            vitals.push({ name, value });
+        }
+    }
+
+    const medication_history = [];
+    for (const e of vList(o.medication_history, 15)) {
+        const name = vStr(e?.name, 120);
+        if (!name) continue;
+        medication_history.push({
+            name,
+            dosage: vStr(asText(e?.dosage), 80),
+            duration: vStr(e?.duration, 60),
+            status: vStr(e?.status, 40),
+            instruction: strList(e?.instruction, 100, 6),
+        });
+    }
+
+    const family_history = [];
+    for (const e of vList(o.family_history, 10)) {
+        const relationship = vStr(e?.relationship, 60);
+        const illness = strList(e?.illness, 100, 8);
+        if (relationship || illness.length) {
+            family_history.push({
+                relationship,
+                illness,
+                notes: vStr(e?.notes, 300),
+            });
+        }
+    }
+
+    const system_review = [];
+    for (const e of vList(o.system_review, 12)) {
+        const name = vStr(e?.name, 80);
+        const findings = strList(e?.findings, 150, 12);
+        if (name || findings.length) {
+            system_review.push({ name, findings, notes: vStr(e?.notes, 300) });
+        }
+    }
+
+    const investigation_history = [];
+    for (const e of vList(o.investigation_history, 8)) {
+        const readings = vList(e?.readings, 20)
+            .map((r) => ({
+                investigation_name: vStr(r?.investigation_name, 120),
+                result: vStr(asText(r?.result), 60),
+                unit: vStr(r?.unit, 30),
+                interpretation: vStr(r?.interpretation, 60),
+                notes: vStr(r?.notes, 200),
+            }))
+            .filter((r) => r.investigation_name);
+        if (readings.length) {
+            investigation_history.push({
+                name: vStr(e?.name, 120),
+                date: vStr(e?.date, 40),
+                readings,
+            });
+        }
+    }
+
+    return {
+        vitals,
+        allergies: simple("allergies", [
+            ["name", 120],
+            ["notes", 300],
+        ]),
+        conditions: simple("conditions", [
+            ["name", 120],
+            ["duration", 60],
+            ["notes", 300],
+        ]),
+        medication_history,
+        investigation_history,
+        procedures: simple("procedures", [
+            ["name", 120],
+            ["date", 40],
+            ["notes", 300],
+        ]),
+        system_review,
+        family_history,
+        lifestyle_habits: simple("lifestyle_habits", [
+            ["name", 120],
+            ["frequency", 60],
+            ["duration", 60],
+            ["notes", 300],
+        ]),
+        social_history: simple("social_history", [
+            ["name", 120],
+            ["notes", 300],
+        ]),
+        other_history: simple("other_history", [
+            ["name", 120],
+            ["notes", 300],
+        ]),
+        prescription: cleanVoiceRx(o.prescription),
+    };
+}
+
+const countRows = (rows) =>
+    Object.entries(rows).reduce(
+        (n, [k, v]) =>
+            n +
+            (k === "prescription"
+                ? Object.values(v).reduce((m, a) => m + a.length, 0)
+                : v.length),
+        0,
+    );
+
+const VOICE_SECTIONS = {
+    all: {
+        label: "Consultation record",
+        skeleton: `{
+  "vitals": [{ "name": "", "value": "" }],
+  "allergies": [{ "name": "", "notes": "" }],
+  "conditions": [{ "name": "", "duration": "", "notes": "" }],
+  "medication_history": [{ "name": "", "dosage": "", "duration": "", "status": "", "instruction": [] }],
+  "investigation_history": [{ "name": "", "date": "", "readings": [{ "investigation_name": "", "result": "", "unit": "", "interpretation": "", "notes": "" }] }],
+  "procedures": [{ "name": "", "date": "", "notes": "" }],
+  "system_review": [{ "name": "", "findings": [], "notes": "" }],
+  "family_history": [{ "relationship": "", "illness": [], "notes": "" }],
+  "lifestyle_habits": [{ "name": "", "frequency": "", "duration": "", "notes": "" }],
+  "social_history": [{ "name": "", "notes": "" }],
+  "other_history": [{ "name": "", "notes": "" }],
+  "prescription": {
+    "symptoms": [{ "name": "", "duration": "", "notes": "" }],
+    "medications": [{ "name": "", "duration": "", "dosage": [], "instructions": "" }],
+    "diagnosis": [{ "name": "" }],
+    "followup": [{ "next_visit_duration": "", "date": "", "advice": "" }]
+  }
+}`,
+        rules: `Where each thing goes:
+- Today's complaint, what brings the patient in now with how long: prescription.symptoms. "name", "duration", "notes".
+- Medicines the doctor prescribes today: prescription.medications. "name" (with strength if said, for example "Paracetamol 500 mg"), "duration" (for example "5 days"), "dosage" (a list of short strings, for example ["1-0-1"] or ["twice daily"]), "instructions" (for example "after food").
+- Diagnosis the doctor states today: prescription.diagnosis, "name".
+- Follow-up: prescription.followup. "next_visit_duration" is how long until the next visit, for example "3 days". "date" only when a specific calendar date is said, written like "25 Oct 2026". Today is {{today}}. "advice" holds advice for the patient, including tests the doctor tells the patient to get.
+- Medicines the patient already takes or took before today: medication_history. "name", "dosage" (short text), "duration", "status" (for example "Ongoing" or "Stopped"), "instruction" (a list).
+- Long-term or past illnesses: conditions. "name", "duration", "notes".
+- Allergies: allergies. "name", "notes" (for example the reaction).
+- Past operations or procedures: procedures. "name", "date", "notes".
+- Illnesses in relatives: family_history. "relationship" (for example "Father"), "illness" (a list), "notes".
+- Examination findings by body system: system_review. "name" is the body system, for example "Cardiovascular". "findings" is a list of short findings. "notes".
+- Lab or scan results with values: investigation_history. "name" is the report, for example "Lipid profile". "date". "readings" is a list of objects with "investigation_name", "result", "unit", "interpretation", "notes".
+- Habits such as smoking, alcohol, exercise, sleep, diet: lifestyle_habits. "name", "frequency", "duration", "notes".
+- Occupation, living situation, marital status, support at home: social_history. "name", "notes".
+- Anything else about the history that fits nowhere above, such as travel: other_history. "name", "notes".
+- Vital signs: vitals. Use exactly these names and units, converting if needed: "Systolic Blood Pressure" (mmHg), "Diastolic Blood Pressure" (mmHg), "Body Temperature" (°F), "Respiration" (per minute), "Body Weight" (kgs), "Body Height" (ft, decimal feet, for example 5 ft 6 in is 5.5). "value" is the number only. Blood pressure 120 over 80 gives two entries.
+- Put each fact in one place only. Leave a list empty when the doctor did not speak about it.`,
+        clean: cleanAllVoice,
+    },
+};
+// Returns cleaned rows, or null when the model gave nothing readable
+async function parseVoice(spec, heard) {
+    const today = istTodayLong();
+    const base = fs
+        .readFileSync("voice-edit-prompt.md", "utf-8")
+        .replace("{{rules}}", () => spec.rules)
+        .replace("{{section}}", () => spec.label)
+        .replace("{{skeleton}}", () => spec.skeleton)
+        .replaceAll("{{today}}", () => today)
+        .replace("{{heard}}", () => heard);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const payload = {
+                model: "gemma4:31b-cloud",
+                prompt:
+                    attempt === 0
+                        ? base
+                        : `${base}\n\nIMPORTANT: Your previous reply could not be read. Reply with exactly one valid JSON object. Nothing else.`,
+                stream: false,
+            };
+            if (attempt > 0) payload.format = "json"; // unconfirmed for this model. Delete if it causes a 400.
+            const r = await axios.post(
+                "https://ollama.com/api/generate",
+                payload,
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
+                    },
+                    timeout: 60000,
+                },
+            );
+            const obj = parseModelJson(r.data?.response);
+            if (obj) return spec.clean(obj);
+        } catch (err) {
+            console.log(
+                `⚠️ Voice parse attempt ${attempt + 1} failed:`,
+                err.message,
+            );
+        }
+        if (attempt === 0) await sleep(500);
+    }
+    return null;
+}
+
+app.post(
+    "/voice/parse",
+    (req, res, next) =>
+        voiceUpload.single("audio")(req, res, (err) =>
+            err
+                ? res.status(400).json({
+                      error: "That recording is too large. Keep it under 2 minutes.",
+                  })
+                : next(),
+        ),
+    async (req, res) => {
+        const file = req.file;
+        try {
+            const spec = VOICE_SECTIONS[String(req.body?.section || "all")];
+            if (!spec)
+                return res.status(400).json({ error: "Unknown section" });
+            if (!file || file.size < 1500) {
+                return res
+                    .status(400)
+                    .json({ error: "No speech was recorded" });
+            }
+
+            let heard = "";
+            let language = "unknown";
+            try {
+                const out = await transcribeWithElevenLabs(
+                    file.path,
+                    file.originalname,
+                    file.mimetype,
+                );
+                heard = (out.transcript || "").trim();
+                language = out.language || "unknown";
+            } catch (err) {
+                console.log(
+                    "❌ Voice transcription failed:",
+                    err.response?.data || err.message,
+                );
+                return res.status(502).json({
+                    error: "Couldn't understand the recording. Please try again.",
+                });
+            }
+
+            if (heard.length < 3) {
+                return res.json({
+                    heard: "",
+                    language,
+                    rows: spec.clean({}),
+                    empty: true,
+                });
+            }
+
+            const rows = await parseVoice(spec, heard);
+            if (!rows) {
+                return res.status(502).json({
+                    error: "Couldn't understand the recording. Please try again.",
+                });
+            }
+            res.json({ heard, language, rows, empty: countRows(rows) === 0 });
+        } catch (err) {
+            console.log("❌ Voice route failed:", err.message);
+            res.status(500).json({
+                error: "Couldn't understand the recording. Please try again.",
+            });
+        } finally {
+            if (file) fs.unlink(file.path, () => {});
+        }
+    },
+);
+app.post("/consultations/:id/voice/apply", async (req, res) => {
+    try {
+        const c = await loadConsultationFull(req.params.id, req.userId);
+        if (!c) return res.status(404).json({ error: "Not found" });
+
+        const rows = VOICE_SECTIONS.all.clean(req.body?.rows); // never trust the browser's shape
+        if (countRows(rows) === 0)
+            return res.status(400).json({ error: "Nothing to add" });
+
+        const sd = sdOf(c);
+        const next = { ...sd };
+        const patch = {};
+        const arrOf = (k) => (Array.isArray(sd[k]) ? sd[k] : []);
+
+        for (const key of [
+            "allergies",
+            "conditions",
+            "medication_history",
+            "procedures",
+            "lifestyle_habits",
+            "social_history",
+            "other_history",
+        ]) {
+            if (!rows[key].length) continue;
+            patch[key] = next[key] = await sanitizeSimpleList(
+                SIMPLE_SECTIONS[key],
+                [...arrOf(key), ...rows[key]],
+                arrOf(key),
+            );
+        }
+        if (rows.family_history.length) {
+            patch.family_history = next.family_history =
+                await sanitizeFamilyHistory(
+                    [...arrOf("family_history"), ...rows.family_history],
+                    arrOf("family_history"),
+                );
+        }
+        if (rows.system_review.length) {
+            patch.system_review = next.system_review =
+                await sanitizeSystemReview(
+                    [...arrOf("system_review"), ...rows.system_review],
+                    arrOf("system_review"),
+                );
+        }
+        if (rows.investigation_history.length) {
+            patch.investigation_history = next.investigation_history =
+                await sanitizeInvestigations(
+                    [
+                        ...arrOf("investigation_history"),
+                        ...rows.investigation_history,
+                    ],
+                    arrOf("investigation_history"),
+                );
+        }
+        if (rows.vitals.length) {
+            patch.vitals = next.vitals = await sanitizeVitals(
+                rows.vitals,
+                sd.vitals,
+            );
+        }
+
+        const rxIn = rows.prescription;
+        if (Object.values(rxIn).some((a) => a.length)) {
+            const rx =
+                sd.prescription && typeof sd.prescription === "object"
+                    ? sd.prescription
+                    : {};
+            const cur = (k) => (Array.isArray(rx[k]) ? rx[k] : []);
+            const cleaned = {};
+            for (const key of [
+                "symptoms",
+                "medications",
+                "diagnosis",
+                "followup",
+            ]) {
+                if (!rxIn[key].length) continue;
+                cleaned[key] = await sanitizeRxList(
+                    key,
+                    [...cur(key), ...rxIn[key]],
+                    cur(key),
+                );
+            }
+            patch.prescription = next.prescription = { ...rx, ...cleaned };
+        }
+
+        const updated = await afterConsultationEdit(c.id, next);
+        res.json({ patch, consultation_summary: updated.consultation_summary });
+    } catch (err) {
+        console.log("⚠️ Voice apply failed:", err.message);
+        res.status(500).json({
+            error: "Couldn't add to the record. Please try again.",
+        });
     }
 });
 const PORT = process.env.PORT || 8000;
