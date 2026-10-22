@@ -2,3 +2,6 @@ node_modules/
 .env
 uploads/
 *.log
+scripts/
+terms-large.txt
+terms.txt

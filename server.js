@@ -10,7 +10,7 @@ require("dotenv").config();
 const FormData = require("form-data");
 if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
 const { clerkMiddleware, getAuth } = require("@clerk/express");
-
+const createTerminology = require("./terminology");
 // CORS (must allow Authorization + handle preflight)
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*"); // ideally your frontend URL
@@ -95,18 +95,9 @@ const UMLS_API_KEY = process.env.UMLS_API_KEY;
 const UTS_BASE_URL = "https://uts-ws.nlm.nih.gov/rest";
 
 // Maps each JSON field name to its UMLS source vocabulary abbreviation (SAB).
-const SAB_MAP = {
-    snomed_ct_code: "SNOMEDCT_US",
-    icd10_code: "ICD10CM",
-    icd10_pcs_code: "ICD10PCS",
-    rxnorm_code: "RXNORM",
-    loinc_code: "LNC",
-    interpretation_snomed_code: "SNOMEDCT_US",
-};
 
 // In-memory cache so repeated codes (fixed vitals LOINC codes, common
 // conditions across patients) don't re-hit UMLS every single request.
-const codeCache = new Map();
 async function attachmentToImages(file) {
     if (file.mimetype.startsWith("image/")) {
         return [fs.readFileSync(file.path).toString("base64")];
@@ -123,207 +114,6 @@ async function attachmentToImages(file) {
         `⚠️ Unsupported attachment type: ${file.mimetype} (${file.originalname})`,
     );
     return [];
-}
-async function verifyAndCorrectCode(sab, code, term) {
-    // No code at all, but we have a name to search on — try to fill one in.
-    if (!code) {
-        if (!term)
-            return { code: "", verified: null, corrected: false, term: null };
-        const found = await searchCode(sab, term);
-        return found
-            ? {
-                  code: found.code,
-                  verified: true,
-                  corrected: true,
-                  term: found.name,
-              }
-            : { code: "", verified: null, corrected: false, term: null };
-    }
-
-    const cacheKey = `verify:${sab}:${code}`;
-    let check = codeCache.get(cacheKey);
-    if (!check) {
-        try {
-            const response = await axios.get(
-                `${UTS_BASE_URL}/content/current/source/${sab}/${encodeURIComponent(code)}`,
-                { params: { apiKey: UMLS_API_KEY } },
-            );
-            check = { valid: true, name: response.data?.result?.name || null };
-        } catch (err) {
-            check =
-                err.response?.status === 404
-                    ? { valid: false, name: null }
-                    : { valid: null, name: null };
-            if (err.response?.status !== 404) {
-                console.log(
-                    `⚠️ UMLS verify failed for ${sab}/${code}:`,
-                    err.response?.status,
-                    err.message,
-                );
-            }
-        }
-        codeCache.set(cacheKey, check);
-    }
-
-    if (check.valid === true) {
-        return { code, verified: true, corrected: false, term: check.name };
-    }
-
-    if (check.valid === false && term) {
-        const found = await searchCode(sab, term);
-        if (found) {
-            return {
-                code: found.code,
-                verified: true,
-                corrected: true,
-                term: found.name,
-            };
-        }
-        return { code, verified: false, corrected: false, term: null }; // couldn't find a replacement — keep it flagged
-    }
-
-    return { code, verified: check.valid, corrected: false, term: check.name };
-}
-async function searchCode(sab, term) {
-    if (!term) return null;
-    const cacheKey = `search:${sab}:${term.toLowerCase()}`;
-    if (codeCache.has(cacheKey)) return codeCache.get(cacheKey);
-
-    let result = null;
-    try {
-        const response = await axios.get(`${UTS_BASE_URL}/search/current`, {
-            params: {
-                apiKey: UMLS_API_KEY,
-                string: term,
-                sabs: sab,
-                returnIdType: "code",
-                pageSize: 1,
-            },
-        });
-        const hit = response.data?.result?.results?.[0];
-        if (hit && hit.ui && hit.ui !== "NONE") {
-            result = { code: hit.ui, name: hit.name };
-        }
-    } catch (err) {
-        console.log(
-            `⚠️ UMLS search failed for ${sab}/"${term}":`,
-            err.response?.status,
-            err.message,
-        );
-    }
-    codeCache.set(cacheKey, result);
-    return result;
-}
-function termForField(entry, key) {
-    switch (key) {
-        case "snomed_ct_code":
-        case "icd10_code":
-        case "icd10_pcs_code":
-            return entry.snomed_ct_term || entry.name || null;
-        case "rxnorm_code":
-            return entry.name || null;
-        case "loinc_code":
-            return entry.investigation_name || entry.name || null;
-        case "interpretation_snomed_code":
-            return entry.interpretation || null;
-        default:
-            return null;
-    }
-}
-async function verifyEntry(entry) {
-    if (!entry || typeof entry !== "object") return;
-    for (const key of Object.keys(SAB_MAP)) {
-        if (!(key in entry)) continue;
-        const sab = SAB_MAP[key];
-        const term = termForField(entry, key);
-        const result = await verifyAndCorrectCode(sab, entry[key], term);
-        entry[key] = result.code;
-        entry[`${key}_verified`] = result.verified;
-        entry[`${key}_corrected`] = result.corrected;
-        entry[`${key}_umls_term`] = result.term;
-    }
-}
-async function verifyFamilyIllness(entry) {
-    if (!Array.isArray(entry.illness)) return;
-    const snomed = [];
-    const icd10 = [];
-    for (let i = 0; i < entry.illness.length; i++) {
-        const term = entry.illness[i];
-        snomed.push(
-            await verifyAndCorrectCode(
-                "SNOMEDCT_US",
-                entry.snomed_ct_codes?.[i] || "",
-                term,
-            ),
-        );
-        icd10.push(
-            await verifyAndCorrectCode(
-                "ICD10CM",
-                entry.icd10_codes?.[i] || "",
-                term,
-            ),
-        );
-    }
-    entry.snomed_ct_codes = snomed.map((r) => r.code);
-    entry.snomed_ct_codes_verified = snomed.map((r) => r.verified);
-    entry.snomed_ct_codes_corrected = snomed.map((r) => r.corrected);
-    entry.icd10_codes = icd10.map((r) => r.code);
-    entry.icd10_codes_verified = icd10.map((r) => r.verified);
-    entry.icd10_codes_corrected = icd10.map((r) => r.corrected);
-}
-async function verifyFindings(findings) {
-    if (!Array.isArray(findings)) return;
-    for (const f of findings) {
-        const result = await verifyAndCorrectCode(
-            "SNOMEDCT_US",
-            f.snomed_ct_code,
-            f.finding,
-        );
-        f.snomed_ct_code = result.code;
-        f.snomed_ct_code_verified = result.verified;
-        f.snomed_ct_code_corrected = result.corrected;
-    }
-}
-async function verifyAllCodes(data) {
-    for (const [sectionName, section] of Object.entries(data)) {
-        if (sectionName === "vitals" || sectionName === "consultation_summary")
-            continue;
-
-        if (sectionName === "family_history") {
-            for (const entry of section) {
-                await verifyFamilyIllness(entry);
-            }
-            continue;
-        }
-
-        if (
-            sectionName === "prescription" &&
-            section &&
-            typeof section === "object"
-        ) {
-            for (const subList of Object.values(section)) {
-                if (!Array.isArray(subList)) continue;
-                for (const entry of subList) {
-                    await verifyEntry(entry);
-                }
-            }
-            continue;
-        }
-
-        if (!Array.isArray(section)) continue;
-
-        for (const entry of section) {
-            await verifyEntry(entry);
-            if (Array.isArray(entry.readings)) {
-                for (const reading of entry.readings)
-                    await verifyEntry(reading);
-            }
-            if (Array.isArray(entry.findings)) {
-                await verifyFindings(entry.findings);
-            }
-        }
-    }
-    return data;
 }
 async function transcribeWithGroq(filePath, originalName, mimetype) {
     const form = new FormData();
@@ -450,6 +240,229 @@ async function transcribeWithElevenLabs(filePath, originalName, mimetype) {
         words: result.words || [],
     };
 }
+async function llmJson(prompt) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const payload = {
+                model: "gemma4:31b-cloud",
+                prompt,
+                stream: false,
+                options: { temperature: 0 }, // same input, same answer
+            };
+            if (attempt > 0) payload.format = "json"; // unconfirmed for this model. Delete if it causes a 400.
+            const r = await axios.post(
+                "https://ollama.com/api/generate",
+                payload,
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
+                    },
+                    timeout: 90000,
+                },
+            );
+            const obj = parseModelJson(r.data?.response);
+            if (obj) return obj;
+        } catch (err) {
+            console.log(
+                `⚠️ Model call ${attempt + 1} failed:`,
+                err.response?.status || err.message,
+            );
+        }
+    }
+    return null;
+}
+
+const terminology = createTerminology({
+    axios,
+    apiKey: process.env.UMLS_API_KEY,
+    llmJson,
+});
+
+const FIELD_VOCAB = {
+    snomed_ct_code: "snomed",
+    icd10_code: "icd10",
+    rxnorm_code: "rxnorm",
+    loinc_code: "loinc",
+    interpretation_snomed_code: "snomed",
+};
+const FIELD_KIND = {
+    rxnorm_code: "drug",
+    loinc_code: "lab",
+    interpretation_snomed_code: "interpretation",
+};
+
+function termForField(entry, key) {
+    if (key === "loinc_code")
+        return entry.investigation_name || entry.name || null;
+    if (key === "interpretation_snomed_code")
+        return entry.interpretation || null;
+    return entry.name || null;
+}
+
+const verifiedFlag = (status) =>
+    status === "verified" ? true : status === "review" ? null : false;
+
+function applyResult(target, key, res) {
+    target[key] = res.code || "";
+    target[`${key}_verified`] = verifiedFlag(res.status);
+    target[`${key}_corrected`] = false;
+    target[`${key}_umls_term`] = res.term || null;
+    target[`${key}_status`] = res.status;
+    target[`${key}_alts`] = res.alts || [];
+    if (key === "snomed_ct_code" && "snomed_ct_term" in target)
+        target.snomed_ct_term = res.term || "";
+}
+
+// The model's own codes are ignored. Every code is looked up from the name.
+async function verifyEntry(entry, kind = "condition") {
+    if (!entry || typeof entry !== "object") return;
+    if ("icd10_pcs_code" in entry) entry.icd10_pcs_code = ""; // not coded
+    for (const key of Object.keys(FIELD_VOCAB)) {
+        if (!(key in entry)) continue;
+        const term = termForField(entry, key);
+        if (!term) {
+            entry[key] = "";
+            continue;
+        }
+        applyResult(
+            entry,
+            key,
+            await terminology.resolve(
+                FIELD_VOCAB[key],
+                term,
+                FIELD_KIND[key] || kind,
+            ),
+        );
+    }
+}
+
+async function verifyFamilyIllness(entry) {
+    if (!Array.isArray(entry.illness)) return;
+    const s = [];
+    const i = [];
+    for (const term of entry.illness) {
+        s.push(await terminology.resolve("snomed", term, "disorder"));
+        i.push(await terminology.resolve("icd10", term, "disorder"));
+    }
+    const put = (key, list) => {
+        entry[key] = list.map((r) => r.code || "");
+        entry[`${key}_verified`] = list.map((r) => verifiedFlag(r.status));
+        entry[`${key}_corrected`] = list.map(() => false);
+        entry[`${key}_status`] = list.map((r) => r.status);
+        entry[`${key}_alts`] = list.map((r) => r.alts || []);
+        entry[`${key}_terms`] = list.map((r) => r.term || "");
+    };
+    put("snomed_ct_codes", s);
+    put("icd10_codes", i);
+}
+
+async function verifyFindings(findings) {
+    if (!Array.isArray(findings)) return;
+    for (const f of findings) {
+        if (!f?.finding) {
+            if (f) f.snomed_ct_code = "";
+            continue;
+        }
+        applyResult(
+            f,
+            "snomed_ct_code",
+            await terminology.resolve("snomed", f.finding, "finding"),
+        );
+    }
+}
+
+const KIND_BY_SECTION = {
+    allergies: "allergy",
+    conditions: "condition",
+    procedures: "procedure",
+    lifestyle_habits: "lifestyle",
+    social_history: "social",
+    medication_history: "drug",
+};
+const KIND_BY_RX = {
+    symptoms: "symptom",
+    medications: "drug",
+    diagnosis: "diagnosis",
+};
+
+async function verifyAllCodes(data) {
+    for (const [sectionName, section] of Object.entries(data)) {
+        if (
+            ["vitals", "consultation_summary", "suggested_plan"].includes(
+                sectionName,
+            )
+        )
+            continue;
+
+        if (sectionName === "family_history") {
+            for (const entry of Array.isArray(section) ? section : [])
+                await verifyFamilyIllness(entry);
+            continue;
+        }
+        if (
+            sectionName === "prescription" &&
+            section &&
+            typeof section === "object"
+        ) {
+            for (const [sub, list] of Object.entries(section)) {
+                if (!Array.isArray(list)) continue;
+                for (const entry of list)
+                    await verifyEntry(entry, KIND_BY_RX[sub] || "condition");
+            }
+            continue;
+        }
+        if (!Array.isArray(section)) continue;
+        const kind = KIND_BY_SECTION[sectionName] || "condition";
+        for (const entry of section) {
+            await verifyEntry(entry, kind);
+            if (Array.isArray(entry?.readings))
+                for (const r of entry.readings) await verifyEntry(r, "lab");
+            if (Array.isArray(entry?.findings))
+                await verifyFindings(entry.findings);
+        }
+    }
+    return data;
+}
+
+// Every (vocabulary, term) the record needs, so lookups run together
+function codeJobs(sd) {
+    const jobs = [];
+    const list = (v) => (Array.isArray(v) ? v : []);
+    const add = (vocab, text, kind) =>
+        text && jobs.push({ vocab, text: String(text), kind });
+    const both = (text, kind) => {
+        add("snomed", text, kind);
+        add("icd10", text, kind);
+    };
+    list(sd.allergies).forEach((e) => both(e?.name, "allergy"));
+    list(sd.conditions).forEach((e) => both(e?.name, "condition"));
+    list(sd.procedures).forEach((e) => add("snomed", e?.name, "procedure"));
+    list(sd.lifestyle_habits).forEach((e) =>
+        add("snomed", e?.name, "lifestyle"),
+    );
+    list(sd.social_history).forEach((e) => add("snomed", e?.name, "social"));
+    list(sd.medication_history).forEach((e) => add("rxnorm", e?.name, "drug"));
+    list(sd.family_history).forEach((e) =>
+        list(e?.illness).forEach((t) => both(t, "disorder")),
+    );
+    list(sd.system_review).forEach((e) =>
+        list(e?.findings).forEach((f) =>
+            add("snomed", typeof f === "string" ? f : f?.finding, "finding"),
+        ),
+    );
+    list(sd.investigation_history).forEach((inv) =>
+        list(inv?.readings).forEach((r) => {
+            add("loinc", r?.investigation_name, "lab");
+            add("snomed", r?.interpretation, "interpretation");
+        }),
+    );
+    const rx = sd.prescription || {};
+    list(rx.symptoms).forEach((e) => add("snomed", e?.name, "symptom"));
+    list(rx.medications).forEach((e) => add("rxnorm", e?.name, "drug"));
+    list(rx.diagnosis).forEach((e) => both(e?.name, "diagnosis"));
+    return jobs;
+}
+const warmCodes = (sd) => terminology.warm(codeJobs(sd));
 async function regeneratePatientSummary(patientId) {
     const { data, error } = await supabase
         .from("consultations")
@@ -1069,10 +1082,11 @@ app.post(
             });
             // ---- 4. Code verification. Never blocks. ----
             try {
+                await warmCodes(structuredData);
                 structuredData = await verifyAllCodes(structuredData);
             } catch (err) {
                 console.log(
-                    "⚠️ UMLS verification failed, keeping unverified codes:",
+                    "⚠️ Code lookup failed, keeping what was found:",
                     err.message,
                 );
             }
@@ -1349,8 +1363,14 @@ async function sanitizeRxList(key, incoming, existing) {
             } else {
                 Object.assign(entry, BLANK_CODES[key]);
                 try {
-                    await verifyEntry(entry);
-                } catch (err) {
+await verifyEntry(
+    entry,
+    key === "medications"
+        ? "drug"
+        : key === "diagnosis"
+          ? "diagnosis"
+          : "symptom",
+);                } catch (err) {
                     console.log(
                         "⚠️ Code lookup failed for edited entry:",
                         err.message,
@@ -1412,18 +1432,22 @@ app.put("/consultations/:id/prescription", async (req, res) => {
 });
 const SIMPLE_SECTIONS = {
     allergies: {
+        kind: "allergy",
         fields: ["name", "notes"],
         codeFields: ["snomed_ct_code", "icd10_code"],
     },
     conditions: {
+        kind: "condition",
         fields: ["name", "duration", "start_date", "end_date", "notes"],
         codeFields: ["snomed_ct_code", "icd10_code"],
     },
     procedures: {
+        kind: "procedure",
         fields: ["name", "date", "notes"],
         codeFields: ["snomed_ct_code", "icd10_pcs_code"],
     },
     lifestyle_habits: {
+        kind: "lifestyle",
         fields: [
             "name",
             "frequency",
@@ -1435,11 +1459,18 @@ const SIMPLE_SECTIONS = {
         codeFields: ["snomed_ct_code"],
     },
     social_history: {
+        kind: "social",
         fields: ["name", "notes"],
         codeFields: ["snomed_ct_code"],
     },
-    other_history: { fields: ["name", "notes"], codeFields: [] },
+
+    other_history: {
+        kind: "condition",
+        fields: ["name", "notes"],
+        codeFields: [],
+    },
     medication_history: {
+        kind: "drug",
         fields: [
             "name",
             "dosage",
@@ -1486,7 +1517,7 @@ async function sanitizeSimpleList(config, incoming, existing) {
         } else {
             for (const cf of config.codeFields) entry[cf] = "";
             try {
-                await verifyEntry(entry);
+                await verifyEntry(entry, config.kind);
             } catch (err) {
                 console.log(
                     "⚠️ Code lookup failed for edited entry:",
@@ -1644,8 +1675,7 @@ async function sanitizeInvestigations(incoming, existing) {
                 entry.loinc_code = "";
                 entry.interpretation_snomed_code = "";
                 try {
-                    await verifyEntry(entry);
-                } catch (err) {
+await verifyEntry(entry, "lab");                } catch (err) {
                     console.log(
                         "⚠️ Investigation code lookup failed:",
                         err.message,
@@ -3778,6 +3808,9 @@ app.post("/consultations/:id/voice/apply", async (req, res) => {
             return res.status(400).json({ error: "Nothing to add" });
 
         const sd = sdOf(c);
+        const t0 = Date.now();
+        await warmCodes(rows); // all lookups at once
+        const tLookup = Date.now() - t0;
         const next = { ...sd };
         const patch = {};
         const arrOf = (k) => (Array.isArray(sd[k]) ? sd[k] : []);
@@ -3853,12 +3886,235 @@ app.post("/consultations/:id/voice/apply", async (req, res) => {
             patch.prescription = next.prescription = { ...rx, ...cleaned };
         }
 
-        const updated = await afterConsultationEdit(c.id, next);
-        res.json({ patch, consultation_summary: updated.consultation_summary });
+        const { error: saveErr } = await supabase
+            .from("consultations")
+            .update({ structured_data: next })
+            .eq("id", c.id)
+            .eq("owner_id", req.userId);
+        if (saveErr) throw saveErr;
+
+        console.log(
+            `voice apply: lookups ${tLookup} ms, total ${Date.now() - t0} ms`,
+        );
+        res.json({ patch }); // the overview refreshes separately
     } catch (err) {
         console.log("⚠️ Voice apply failed:", err.message);
         res.status(500).json({
             error: "Couldn't add to the record. Please try again.",
+        });
+    }
+});
+async function refreshSummary(consultationId, owner) {
+    const c = await loadConsultationFull(consultationId, owner);
+    if (!c) return null;
+    const summary = await regenerateConsultationSummary(sdOf(c));
+    // Read again, so edits made while the model was thinking are not overwritten
+    const { data: fresh, error } = await supabase
+        .from("consultations")
+        .select("structured_data")
+        .eq("id", consultationId)
+        .eq("owner_id", owner)
+        .maybeSingle();
+    if (error || !fresh) return null;
+    const up = await supabase
+        .from("consultations")
+        .update({
+            structured_data: {
+                ...(fresh.structured_data || {}),
+                consultation_summary: summary,
+            },
+        })
+        .eq("id", consultationId)
+        .eq("owner_id", owner);
+    if (up.error) throw up.error;
+    regeneratePatientSummary(c.patient_id).catch(() => {});
+    return summary;
+}
+
+app.post("/consultations/:id/summary/refresh", async (req, res) => {
+    try {
+        const summary = await refreshSummary(req.params.id, req.userId);
+        if (!summary) return res.status(404).json({ error: "Not found" });
+        res.json({ consultation_summary: summary });
+    } catch (err) {
+        console.log("⚠️ Summary refresh failed:", err.message);
+        res.status(500).json({ error: "Couldn't refresh the summary" });
+    }
+});
+const CODE_FIELDS = new Set([
+    "snomed_ct_code",
+    "icd10_code",
+    "rxnorm_code",
+    "loinc_code",
+    "interpretation_snomed_code",
+]);
+const CODE_ARRAYS = new Set(["snomed_ct_codes", "icd10_codes"]);
+const CODE_SECTIONS = new Set([
+    "allergies",
+    "conditions",
+    "procedures",
+    "lifestyle_habits",
+    "social_history",
+    "medication_history",
+    "investigation_history",
+    "system_review",
+    "family_history",
+    "prescription",
+]);
+const vocabOfField = (k) =>
+    k.startsWith("snomed") || k === "interpretation_snomed_code"
+        ? "snomed"
+        : k.startsWith("icd10")
+          ? "icd10"
+          : k.startsWith("rxnorm")
+            ? "rxnorm"
+            : k.startsWith("loinc")
+              ? "loinc"
+              : null;
+
+// Finds the exact field a path points at. Anything unexpected returns null.
+function locateCode(sd, path) {
+    if (!Array.isArray(path) || path.length < 2 || path.length > 8) return null;
+    if (!CODE_SECTIONS.has(path[0])) return null;
+    const ok = (s) =>
+        (Number.isInteger(s) && s >= 0 && s < 1000) ||
+        (typeof s === "string" && /^[a-z0-9_]+$/.test(s));
+    if (!path.every(ok)) return null;
+    const last = path[path.length - 1];
+    const isIdx = Number.isInteger(last);
+    const key = isIdx ? path[path.length - 2] : last;
+    if (isIdx ? !CODE_ARRAYS.has(key) : !CODE_FIELDS.has(key)) return null;
+    let cur = sd;
+    for (const seg of path.slice(0, isIdx ? -2 : -1)) {
+        if (
+            cur == null ||
+            typeof cur !== "object" ||
+            !Object.prototype.hasOwnProperty.call(cur, seg)
+        )
+            return null;
+        cur = cur[seg];
+    }
+    if (!cur || typeof cur !== "object" || Array.isArray(cur)) return null;
+    return { owner: cur, key, index: isIdx ? last : null };
+}
+
+function applyConfirmed(loc, code, term) {
+    const { owner, key, index } = loc;
+    if (index === null) {
+        owner[key] = code;
+        owner[`${key}_verified`] = true;
+        owner[`${key}_corrected`] = false;
+        owner[`${key}_umls_term`] = term;
+        owner[`${key}_status`] = "confirmed";
+        owner[`${key}_alts`] = [];
+        if (key === "snomed_ct_code" && "snomed_ct_term" in owner)
+            owner.snomed_ct_term = term;
+    } else {
+        const set = (name, v) => {
+            const a = Array.isArray(owner[name]) ? [...owner[name]] : [];
+            a[index] = v;
+            owner[name] = a;
+        };
+        set(key, code);
+        set(`${key}_verified`, true);
+        set(`${key}_corrected`, false);
+        set(`${key}_terms`, term);
+        set(`${key}_status`, "confirmed");
+        set(`${key}_alts`, []);
+    }
+}
+
+app.get("/codes/search", async (req, res) => {
+    try {
+        const vocab = String(req.query.vocab || "");
+        if (!["snomed", "icd10", "rxnorm", "loinc"].includes(vocab)) {
+            return res.status(400).json({ error: "Unknown vocabulary" });
+        }
+        res.json({
+            results: await terminology.searchCodes(
+                vocab,
+                String(req.query.q || ""),
+            ),
+        });
+    } catch (err) {
+        console.log("⚠️ Code search failed:", err.message);
+        res.status(500).json({ error: "Search failed" });
+    }
+});
+
+// Run this first. It shows what your keys can reach.
+app.get("/codes/health", async (req, res) => {
+    try {
+        res.json(await terminology.health());
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Confirm, or swap, one or more codes
+app.put("/consultations/:id/code", async (req, res) => {
+    try {
+        const c = await loadConsultationFull(req.params.id, req.userId);
+        if (!c) return res.status(404).json({ error: "Not found" });
+        const changes = Array.isArray(req.body?.changes)
+            ? req.body.changes.slice(0, 60)
+            : [];
+        if (!changes.length)
+            return res.status(400).json({ error: "Nothing to change" });
+
+        const sd = JSON.parse(JSON.stringify(sdOf(c)));
+        for (const ch of changes) {
+            const loc = locateCode(sd, ch?.path);
+            if (!loc)
+                return res.status(400).json({ error: "Invalid code location" });
+            const code = String(ch?.code ?? "").trim();
+            if (!/^[A-Za-z0-9.\-]{1,40}$/.test(code))
+                return res.status(400).json({ error: "Invalid code" });
+
+            const stored =
+                loc.index === null
+                    ? loc.owner[loc.key]
+                    : loc.owner[loc.key]?.[loc.index];
+            let term;
+            if (stored === code) {
+                // Confirming the code already shown. No lookup needed.
+                term =
+                    (loc.index === null
+                        ? loc.owner[`${loc.key}_umls_term`]
+                        : loc.owner[`${loc.key}_terms`]?.[loc.index]) || "";
+            } else {
+                const found = await terminology.exists(
+                    vocabOfField(loc.key),
+                    code,
+                );
+                if (!found.ok)
+                    return res
+                        .status(502)
+                        .json({
+                            error: "The code service is not reachable. Try again.",
+                        });
+                if (!found.name)
+                    return res
+                        .status(400)
+                        .json({
+                            error: `Code ${code} was not found. Pick one from the list.`,
+                        });
+                term = found.name;
+            }
+            applyConfirmed(loc, code, term);
+        }
+
+        const { error } = await supabase
+            .from("consultations")
+            .update({ structured_data: sd })
+            .eq("id", c.id)
+            .eq("owner_id", req.userId);
+        if (error) throw error;
+        res.json({ structured_data: sd });
+    } catch (err) {
+        console.log("⚠️ Code update failed:", err.message);
+        res.status(500).json({
+            error: "Couldn't save the code. Please try again.",
         });
     }
 });
