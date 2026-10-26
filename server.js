@@ -74,7 +74,8 @@ const supabase = createClient(
 );
 const staffCache = new Map(); // staffUserId -> { doctorId | null, at }
 const STAFF_TTL = 60 * 1000;
-
+const createBrands = require("./brands");
+const brands = createBrands({ supabase, llmJson });
 async function lookupDoctorForStaff(userId) {
     const hit = staffCache.get(userId);
     if (hit && Date.now() - hit.at < STAFF_TTL) return hit.doctorId;
@@ -1094,8 +1095,16 @@ app.post(
                 planPromise,
                 sleep(60000).then(() => null),
             ]);
-            if (plan) structuredData.suggested_plan = plan;
-            // ---- 5. Save ----
+            if (plan) {
+                structuredData.suggested_plan = plan;
+                brands
+                    .warm(
+                        plan.items
+                            .filter((i) => i.kind === "medication")
+                            .map((i) => ({ name: i.name, dosage: i.dosage })),
+                    )
+                    .catch(() => {});
+            } // ---- 5. Save ----
             const { data: consultation, error: saveError } = await supabase
                 .from("consultations")
                 .insert({
@@ -1317,7 +1326,7 @@ app.put("/doctor/profile", async (req, res) => {
 });
 const RX_FIELDS = {
     symptoms: ["name", "duration", "start_date", "end_date", "notes"],
-    medications: ["name", "duration", "instructions"], // dosage handled separately (array)
+    medications: ["name", "duration", "instructions", "brand"],
     diagnosis: ["name"],
     followup: ["next_visit_duration", "date", "advice"],
 };
@@ -1363,14 +1372,15 @@ async function sanitizeRxList(key, incoming, existing) {
             } else {
                 Object.assign(entry, BLANK_CODES[key]);
                 try {
-await verifyEntry(
-    entry,
-    key === "medications"
-        ? "drug"
-        : key === "diagnosis"
-          ? "diagnosis"
-          : "symptom",
-);                } catch (err) {
+                    await verifyEntry(
+                        entry,
+                        key === "medications"
+                            ? "drug"
+                            : key === "diagnosis"
+                              ? "diagnosis"
+                              : "symptom",
+                    );
+                } catch (err) {
                     console.log(
                         "⚠️ Code lookup failed for edited entry:",
                         err.message,
@@ -1675,7 +1685,8 @@ async function sanitizeInvestigations(incoming, existing) {
                 entry.loinc_code = "";
                 entry.interpretation_snomed_code = "";
                 try {
-await verifyEntry(entry, "lab");                } catch (err) {
+                    await verifyEntry(entry, "lab");
+                } catch (err) {
                     console.log(
                         "⚠️ Investigation code lookup failed:",
                         err.message,
@@ -3300,6 +3311,13 @@ app.post("/consultations/:id/suggestion", async (req, res) => {
             .eq("id", c.id)
             .eq("owner_id", req.userId);
         if (error) throw error;
+        brands
+            .warm(
+                plan.items
+                    .filter((i) => i.kind === "medication")
+                    .map((i) => ({ name: i.name, dosage: i.dosage })),
+            )
+            .catch(() => {});
         res.json({ suggested_plan: plan });
     } catch (err) {
         console.log("⚠️ Suggestion route failed:", err.message);
@@ -3357,7 +3375,11 @@ app.post("/consultations/:id/suggestion/approve", async (req, res) => {
         const picked = plan.items.filter((i) => ids.has(i.id));
         if (!picked.length)
             return res.status(400).json({ error: "Select at least one item" });
-
+        const brandMap =
+            req.body?.brands && typeof req.body.brands === "object"
+                ? req.body.brands
+                : {};
+        const brandUses = [];
         const rx =
             sd.prescription && typeof sd.prescription === "object"
                 ? sd.prescription
@@ -3378,12 +3400,25 @@ app.post("/consultations/:id/suggestion/approve", async (req, res) => {
         for (const it of picked) {
             if (it.kind === "medication") {
                 if (!seen(next.medications, it.name)) {
+                    const brand = pstr(
+                        typeof brandMap[it.id] === "string"
+                            ? brandMap[it.id]
+                            : "",
+                        80,
+                    );
                     next.medications.push({
                         name: it.name,
                         duration: it.duration || "",
                         dosage: Array.isArray(it.dosage) ? it.dosage : [],
                         instructions: it.instructions || "",
+                        ...(brand ? { brand } : {}),
                     });
+                    if (brand)
+                        brandUses.push({
+                            name: it.name,
+                            dosage: it.dosage,
+                            brand,
+                        });
                 }
             } else if (it.kind === "diagnosis") {
                 if (!seen(next.diagnosis, it.name))
@@ -3420,6 +3455,9 @@ app.post("/consultations/:id/suggestion/approve", async (req, res) => {
                 approved_ids: [...ids],
             },
         });
+        brandUses.forEach((b) =>
+            brands.bump(req.userId, b.name, b.dosage, b.brand).catch(() => {}),
+        );
         res.json({
             prescription: updated.prescription,
             suggested_plan: updated.suggested_plan,
@@ -3642,7 +3680,281 @@ const countRows = (rows) =>
                 : v.length),
         0,
     );
+// ---- values the doctor can change by voice ----
+const TX = (label, max = 120) => ({ label, type: "text", max });
+const LS = (label, max = 100) => ({ label, type: "list", max });
+const EDIT_SECTIONS = [
+    {
+        sec: "vitals",
+        path: "vitals",
+        label: "Vitals",
+        title: (e) => e.name,
+        fields: { value: TX("Value", 30) },
+    },
+    {
+        sec: "allergies",
+        path: "allergies",
+        label: "Allergy",
+        title: (e) => e.name,
+        fields: { name: TX("Name"), notes: TX("Notes", 300) },
+    },
+    {
+        sec: "conditions",
+        path: "conditions",
+        label: "Condition",
+        title: (e) => e.name,
+        fields: {
+            name: TX("Name"),
+            duration: TX("Duration", 60),
+            notes: TX("Notes", 300),
+        },
+    },
+    {
+        sec: "medication_history",
+        path: "medication_history",
+        label: "Medicine taken",
+        title: (e) => e.name,
+        fields: {
+            name: TX("Name"),
+            dosage: TX("Dosage", 80),
+            duration: TX("Duration", 60),
+            status: TX("Status", 40),
+            instruction: LS("Instructions"),
+        },
+    },
+    {
+        sec: "procedures",
+        path: "procedures",
+        label: "Procedure",
+        title: (e) => e.name,
+        fields: {
+            name: TX("Name"),
+            date: TX("Date", 40),
+            notes: TX("Notes", 300),
+        },
+    },
+    {
+        sec: "lifestyle_habits",
+        path: "lifestyle_habits",
+        label: "Lifestyle",
+        title: (e) => e.name,
+        fields: {
+            name: TX("Name"),
+            frequency: TX("Frequency", 60),
+            duration: TX("Duration", 60),
+            notes: TX("Notes", 300),
+        },
+    },
+    {
+        sec: "social_history",
+        path: "social_history",
+        label: "Social history",
+        title: (e) => e.name,
+        fields: { name: TX("Name"), notes: TX("Notes", 300) },
+    },
+    {
+        sec: "other_history",
+        path: "other_history",
+        label: "Other history",
+        title: (e) => e.name,
+        fields: { name: TX("Name"), notes: TX("Notes", 300) },
+    },
+    {
+        sec: "family_history",
+        path: "family_history",
+        label: "Family history",
+        title: (e) => e.relationship,
+        fields: {
+            relationship: TX("Relative", 60),
+            illness: LS("Illness"),
+            notes: TX("Notes", 300),
+        },
+    },
+    {
+        sec: "system_review",
+        path: "system_review",
+        label: "System review",
+        title: (e) => e.name,
+        fields: { name: TX("System", 80), notes: TX("Notes", 300) },
+    },
+    {
+        sec: "prescription.symptoms",
+        path: "prescription.symptoms",
+        label: "Symptom",
+        title: (e) => e.name,
+        fields: {
+            name: TX("Name"),
+            duration: TX("Duration", 60),
+            notes: TX("Notes", 300),
+        },
+    },
+    {
+        sec: "prescription.medications",
+        path: "prescription.medications",
+        label: "Prescribed",
+        title: (e) => e.name,
+        fields: {
+            name: TX("Name"),
+            duration: TX("Duration", 60),
+            dosage: LS("Dosage", 80),
+            instructions: TX("Instructions", 200),
+            brand: TX("Brand", 80),
+        },
+    },
+    {
+        sec: "prescription.diagnosis",
+        path: "prescription.diagnosis",
+        label: "Diagnosis",
+        title: (e) => e.name,
+        fields: { name: TX("Name") },
+    },
+    {
+        sec: "prescription.followup",
+        path: "prescription.followup",
+        label: "Follow up",
+        title: (e) => e.next_visit_duration || e.date || "Follow up",
+        fields: {
+            next_visit_duration: TX("When", 60),
+            date: TX("Date", 40),
+            advice: TX("Advice", 300),
+        },
+    },
+];
+const READING_SECTION = {
+    sec: "investigation_history.readings",
+    label: "Test result",
+    title: (r) => r.investigation_name,
+    fields: {
+        investigation_name: TX("Test"),
+        result: TX("Result", 60),
+        unit: TX("Unit", 30),
+        interpretation: TX("Interpretation", 60),
+        notes: TX("Notes", 200),
+    },
+};
 
+const asList = (v) =>
+    Array.isArray(v)
+        ? v.map((x) => asText(x).trim()).filter(Boolean)
+        : asText(v).trim()
+          ? [asText(v).trim()]
+          : [];
+const flat = (v) =>
+    (Array.isArray(v) ? v.map(asText).join(", ") : asText(v))
+        .toLowerCase()
+        .replace(/[^a-z0-9.]+/g, " ")
+        .trim();
+
+// Every editable row in the record, each with an id such as "vitals.0"
+function buildEditIndex(sd) {
+    const out = [];
+    for (const def of EDIT_SECTIONS) {
+        const list = def.path.split(".").reduce((o, k) => o?.[k], sd);
+        (Array.isArray(list) ? list : []).forEach((entry, i) => {
+            if (entry && typeof entry === "object")
+                out.push({ id: `${def.sec}.${i}`, def, entry, i });
+        });
+    }
+    (Array.isArray(sd.investigation_history)
+        ? sd.investigation_history
+        : []
+    ).forEach((inv, i) =>
+        (Array.isArray(inv?.readings) ? inv.readings : []).forEach(
+            (entry, j) => {
+                if (entry && typeof entry === "object") {
+                    out.push({
+                        id: `${READING_SECTION.sec}.${i}.${j}`,
+                        def: READING_SECTION,
+                        entry,
+                        i,
+                        j,
+                    });
+                }
+            },
+        ),
+    );
+    return out.slice(0, 150);
+}
+
+// The record as text for the model
+function editIndexText(index) {
+    if (!index.length) return "(none)";
+    return index
+        .map(({ id, def, entry }) => {
+            const fields = Object.entries(def.fields)
+                .map(
+                    ([k, spec]) =>
+                        `${k}=${JSON.stringify(spec.type === "list" ? asList(entry[k]) : asText(entry[k]))}`,
+                )
+                .join(" | ");
+            return `[${id}] ${def.label}: ${pstr(def.title(entry), 80) || "(unnamed)"} | ${fields}`;
+        })
+        .join("\n");
+}
+
+function editValue(raw, spec) {
+    if (spec.type === "list") {
+        const a = Array.isArray(raw)
+            ? raw
+            : typeof raw === "string"
+              ? raw.split(/[,;]/)
+              : [];
+        return a
+            .map((x) => vStr(asText(x).trim(), spec.max))
+            .filter(Boolean)
+            .slice(0, 8);
+    }
+    return vStr(asText(raw).trim(), spec.max);
+}
+
+// Checks every proposed change against the record as it is now. Voice never clears a value.
+function findEdits(rawEdits, index) {
+    const byId = new Map(index.map((r) => [r.id, r]));
+    const out = new Map();
+    for (const e of vList(rawEdits, 40)) {
+        const row = byId.get(vStr(e?.id, 80));
+        const field = vStr(e?.field, 40);
+        const spec = row?.def.fields[field];
+        if (!row || !spec) continue;
+        const value = editValue(e?.value, spec);
+        if (Array.isArray(value) ? value.length === 0 : !value) continue;
+        const was = row.entry[field];
+        if (flat(was) === flat(value)) continue;
+        out.set(`${row.id}|${field}`, {
+            id: row.id,
+            sec: row.def.sec,
+            i: row.i,
+            j: row.j ?? null,
+            field,
+            type: spec.type,
+            label: spec.label,
+            section: row.def.label,
+            title: pstr(row.def.title(row.entry), 120),
+            old: spec.type === "list" ? asList(was).join(", ") : asText(was),
+            new: spec.type === "list" ? value.join(", ") : value,
+            value,
+        });
+    }
+    return [...out.values()];
+}
+
+// Names that change need fresh codes. This feeds the lookup warm-up.
+function withEditedNames(rows, edits) {
+    const out = { ...rows, prescription: { ...rows.prescription } };
+    for (const e of edits) {
+        if (e.field !== "name" || e.type !== "text") continue;
+        if (e.sec.startsWith("prescription.")) {
+            const k = e.sec.split(".")[1];
+            out.prescription[k] = [
+                ...(out.prescription[k] || []),
+                { name: e.value },
+            ];
+        } else if (Array.isArray(out[e.sec])) {
+            out[e.sec] = [...out[e.sec], { name: e.value }];
+        }
+    }
+    return out;
+}
 const VOICE_SECTIONS = {
     all: {
         label: "Consultation record",
@@ -3663,7 +3975,8 @@ const VOICE_SECTIONS = {
     "medications": [{ "name": "", "duration": "", "dosage": [], "instructions": "" }],
     "diagnosis": [{ "name": "" }],
     "followup": [{ "next_visit_duration": "", "date": "", "advice": "" }]
-  }
+  },
+      "edits": [{ "id": "", "field": "", "value": "" }]
 }`,
         rules: `Where each thing goes:
 - Today's complaint, what brings the patient in now with how long: prescription.symptoms. "name", "duration", "notes".
@@ -3681,18 +3994,21 @@ const VOICE_SECTIONS = {
 - Occupation, living situation, marital status, support at home: social_history. "name", "notes".
 - Anything else about the history that fits nowhere above, such as travel: other_history. "name", "notes".
 - Vital signs: vitals. Use exactly these names and units, converting if needed: "Systolic Blood Pressure" (mmHg), "Diastolic Blood Pressure" (mmHg), "Body Temperature" (°F), "Respiration" (per minute), "Body Weight" (kgs), "Body Height" (ft, decimal feet, for example 5 ft 6 in is 5.5). "value" is the number only. Blood pressure 120 over 80 gives two entries.
-- Put each fact in one place only. Leave a list empty when the doctor did not speak about it.`,
+- Put each fact in one place only. Leave a list empty when the doctor did not speak about it.
+- Changing values already in the record: the saved rows are listed under "Existing record". When the doctor corrects or changes something already there ("change", "make it", "correct that", "update", "actually", "not X but Y", "it should be"), put it in "edits" and not in the lists above. Give the row's id, the field name exactly as listed, and the new value. Match by what the doctor names: "temperature" is the row named Body Temperature, "paracetamol" is the prescribed row with Paracetamol in its name. If it could mean two different rows, skip it. A fact that is not in the record yet goes in the lists above as before. For a vital, the field is "value" and the value is the number only. For list fields (dosage, instruction, illness) give a list of short strings. Never delete anything. Never change a field the doctor did not talk about.`,
         clean: cleanAllVoice,
     },
 };
 // Returns cleaned rows, or null when the model gave nothing readable
-async function parseVoice(spec, heard) {
+// Returns { rows, edits }, or null when the model gave nothing readable
+async function parseVoice(spec, heard, record = "(none)") {
     const today = istTodayLong();
     const base = fs
         .readFileSync("voice-edit-prompt.md", "utf-8")
         .replace("{{rules}}", () => spec.rules)
         .replace("{{section}}", () => spec.label)
         .replace("{{skeleton}}", () => spec.skeleton)
+        .replace("{{record}}", () => record)
         .replaceAll("{{today}}", () => today)
         .replace("{{heard}}", () => heard);
 
@@ -3706,7 +4022,7 @@ async function parseVoice(spec, heard) {
                         : `${base}\n\nIMPORTANT: Your previous reply could not be read. Reply with exactly one valid JSON object. Nothing else.`,
                 stream: false,
             };
-            if (attempt > 0) payload.format = "json"; // unconfirmed for this model. Delete if it causes a 400.
+            if (attempt > 0) payload.format = "json";
             const r = await axios.post(
                 "https://ollama.com/api/generate",
                 payload,
@@ -3718,7 +4034,7 @@ async function parseVoice(spec, heard) {
                 },
             );
             const obj = parseModelJson(r.data?.response);
-            if (obj) return spec.clean(obj);
+            if (obj) return { rows: spec.clean(obj), edits: obj.edits };
         } catch (err) {
             console.log(
                 `⚠️ Voice parse attempt ${attempt + 1} failed:`,
@@ -3781,13 +4097,63 @@ app.post(
                 });
             }
 
-            const rows = await parseVoice(spec, heard);
-            if (!rows) {
+            // The record so far, so a spoken correction can point at a saved row
+            let sd = {};
+            let index = [];
+            const cid = String(req.body?.consultation_id || "");
+            if (spec === VOICE_SECTIONS.all && cid) {
+                const c = await loadConsultationFull(cid, req.userId).catch(
+                    () => null,
+                );
+                if (c) {
+                    sd = sdOf(c);
+                    index = buildEditIndex(sd);
+                }
+            }
+
+            const parsed = await parseVoice(spec, heard, editIndexText(index));
+            if (!parsed) {
                 return res.status(502).json({
                     error: "Couldn't understand the recording. Please try again.",
                 });
             }
-            res.json({ heard, language, rows, empty: countRows(rows) === 0 });
+            const rows = parsed.rows;
+            const rawEdits = Array.isArray(parsed.edits)
+                ? [...parsed.edits]
+                : [];
+
+            // A spoken value for a vital that already has one is a change, not a new row
+            if (index.length && Array.isArray(rows.vitals)) {
+                const vit = Array.isArray(sd.vitals) ? sd.vitals : [];
+                rows.vitals = rows.vitals.filter((v) => {
+                    const i = vit.findIndex((x) => x?.name === v.name);
+                    if (i < 0 || !asText(vit[i]?.value).trim()) return true;
+                    rawEdits.push({
+                        id: `vitals.${i}`,
+                        field: "value",
+                        value: v.value,
+                    });
+                    return false;
+                });
+            }
+
+            const edits = findEdits(rawEdits, index).map((e) => ({
+                id: e.id,
+                field: e.field,
+                label: e.label,
+                section: e.section,
+                title: e.title,
+                old: e.old,
+                new: e.new,
+                value: e.value,
+            }));
+            res.json({
+                heard,
+                language,
+                rows,
+                edits,
+                empty: countRows(rows) === 0 && edits.length === 0,
+            });
         } catch (err) {
             console.log("❌ Voice route failed:", err.message);
             res.status(500).json({
@@ -3804,16 +4170,52 @@ app.post("/consultations/:id/voice/apply", async (req, res) => {
         if (!c) return res.status(404).json({ error: "Not found" });
 
         const rows = VOICE_SECTIONS.all.clean(req.body?.rows); // never trust the browser's shape
-        if (countRows(rows) === 0)
-            return res.status(400).json({ error: "Nothing to add" });
-
         const sd = sdOf(c);
+
+        // Every change is checked against the record as it is now, and against the value the doctor saw
+        const index = buildEditIndex(sd);
+        const rawEdits = Array.isArray(req.body?.edits)
+            ? req.body.edits.slice(0, 40)
+            : [];
+        const sentOld = new Map(
+            rawEdits.map((e) => [
+                `${vStr(e?.id, 80)}|${vStr(e?.field, 40)}`,
+                asText(e?.old),
+            ]),
+        );
+        const edits = findEdits(rawEdits, index).filter(
+            (e) => flat(sentOld.get(`${e.id}|${e.field}`)) === flat(e.old),
+        );
+        if (edits.length < rawEdits.length)
+            console.log(
+                `voice apply: skipped ${rawEdits.length - edits.length} change(s)`,
+            );
+        if (countRows(rows) === 0 && edits.length === 0) {
+            return res
+                .status(400)
+                .json({
+                    error: "Nothing to apply. The record may have changed. Try again.",
+                });
+        }
+
         const t0 = Date.now();
-        await warmCodes(rows); // all lookups at once
+        await warmCodes(withEditedNames(rows, edits)); // all lookups at once
         const tLookup = Date.now() - t0;
+
         const next = { ...sd };
         const patch = {};
         const arrOf = (k) => (Array.isArray(sd[k]) ? sd[k] : []);
+        const editsFor = (sec) => edits.filter((e) => e.sec === sec);
+        const withEdits = (list, sec) => {
+            const out = list.map((x) =>
+                x && typeof x === "object" ? { ...x } : x,
+            );
+            editsFor(sec).forEach((e) => {
+                if (out[e.i] && typeof out[e.i] === "object")
+                    out[e.i][e.field] = e.value;
+            });
+            return out;
+        };
 
         for (const key of [
             "allergies",
@@ -3824,67 +4226,92 @@ app.post("/consultations/:id/voice/apply", async (req, res) => {
             "social_history",
             "other_history",
         ]) {
-            if (!rows[key].length) continue;
+            if (!rows[key].length && !editsFor(key).length) continue;
             patch[key] = next[key] = await sanitizeSimpleList(
                 SIMPLE_SECTIONS[key],
-                [...arrOf(key), ...rows[key]],
+                [...withEdits(arrOf(key), key), ...rows[key]],
                 arrOf(key),
             );
         }
-        if (rows.family_history.length) {
+        if (rows.family_history.length || editsFor("family_history").length) {
             patch.family_history = next.family_history =
                 await sanitizeFamilyHistory(
-                    [...arrOf("family_history"), ...rows.family_history],
+                    [
+                        ...withEdits(arrOf("family_history"), "family_history"),
+                        ...rows.family_history,
+                    ],
                     arrOf("family_history"),
                 );
         }
-        if (rows.system_review.length) {
+        if (rows.system_review.length || editsFor("system_review").length) {
             patch.system_review = next.system_review =
                 await sanitizeSystemReview(
-                    [...arrOf("system_review"), ...rows.system_review],
+                    [
+                        ...withEdits(arrOf("system_review"), "system_review"),
+                        ...rows.system_review,
+                    ],
                     arrOf("system_review"),
                 );
         }
-        if (rows.investigation_history.length) {
+
+        const readingEdits = editsFor("investigation_history.readings");
+        if (rows.investigation_history.length || readingEdits.length) {
+            const base = arrOf("investigation_history").map((inv) => ({
+                ...inv,
+                readings: (Array.isArray(inv?.readings)
+                    ? inv.readings
+                    : []
+                ).map((r) => ({ ...r })),
+            }));
+            readingEdits.forEach((e) => {
+                const r = base[e.i]?.readings?.[e.j];
+                if (r) r[e.field] = e.value;
+            });
             patch.investigation_history = next.investigation_history =
                 await sanitizeInvestigations(
-                    [
-                        ...arrOf("investigation_history"),
-                        ...rows.investigation_history,
-                    ],
+                    [...base, ...rows.investigation_history],
                     arrOf("investigation_history"),
                 );
         }
-        if (rows.vitals.length) {
+
+        const vitalsIn = [
+            ...rows.vitals,
+            ...editsFor("vitals")
+                .map((e) => ({
+                    name: arrOf("vitals")[e.i]?.name,
+                    value: e.value,
+                }))
+                .filter((v) => v.name),
+        ];
+        if (vitalsIn.length)
             patch.vitals = next.vitals = await sanitizeVitals(
-                rows.vitals,
+                vitalsIn,
                 sd.vitals,
             );
-        }
 
         const rxIn = rows.prescription;
-        if (Object.values(rxIn).some((a) => a.length)) {
-            const rx =
-                sd.prescription && typeof sd.prescription === "object"
-                    ? sd.prescription
-                    : {};
-            const cur = (k) => (Array.isArray(rx[k]) ? rx[k] : []);
-            const cleaned = {};
-            for (const key of [
-                "symptoms",
-                "medications",
-                "diagnosis",
-                "followup",
-            ]) {
-                if (!rxIn[key].length) continue;
-                cleaned[key] = await sanitizeRxList(
-                    key,
-                    [...cur(key), ...rxIn[key]],
-                    cur(key),
-                );
-            }
-            patch.prescription = next.prescription = { ...rx, ...cleaned };
+        const rx =
+            sd.prescription && typeof sd.prescription === "object"
+                ? sd.prescription
+                : {};
+        const cur = (k) => (Array.isArray(rx[k]) ? rx[k] : []);
+        const cleaned = {};
+        for (const key of [
+            "symptoms",
+            "medications",
+            "diagnosis",
+            "followup",
+        ]) {
+            const sec = `prescription.${key}`;
+            if (!rxIn[key].length && !editsFor(sec).length) continue;
+            cleaned[key] = await sanitizeRxList(
+                key,
+                [...withEdits(cur(key), sec), ...rxIn[key]],
+                cur(key),
+            );
         }
+        if (Object.keys(cleaned).length)
+            patch.prescription = next.prescription = { ...rx, ...cleaned };
 
         const { error: saveErr } = await supabase
             .from("consultations")
@@ -4088,17 +4515,13 @@ app.put("/consultations/:id/code", async (req, res) => {
                     code,
                 );
                 if (!found.ok)
-                    return res
-                        .status(502)
-                        .json({
-                            error: "The code service is not reachable. Try again.",
-                        });
+                    return res.status(502).json({
+                        error: "The code service is not reachable. Try again.",
+                    });
                 if (!found.name)
-                    return res
-                        .status(400)
-                        .json({
-                            error: `Code ${code} was not found. Pick one from the list.`,
-                        });
+                    return res.status(400).json({
+                        error: `Code ${code} was not found. Pick one from the list.`,
+                    });
                 term = found.name;
             }
             applyConfirmed(loc, code, term);
@@ -4116,6 +4539,88 @@ app.put("/consultations/:id/code", async (req, res) => {
         res.status(500).json({
             error: "Couldn't save the code. Please try again.",
         });
+    }
+});
+app.post("/brands/lookup", async (req, res) => {
+    try {
+        const items = Array.isArray(req.body?.items)
+            ? req.body.items.slice(0, 20)
+            : [];
+        const results = await Promise.all(
+            items.map((it) =>
+                brands
+                    .lookupOne(req.userId, {
+                        id: String(it?.id || ""),
+                        name: pstr(it?.name, 160),
+                        dosage: Array.isArray(it?.dosage)
+                            ? it.dosage.map((d) => pstr(d, 80)).slice(0, 6)
+                            : [],
+                    })
+                    .catch((err) => {
+                        console.log("⚠️ Brand lookup failed:", err.message);
+                        return { id: String(it?.id || ""), brands: [] };
+                    }),
+            ),
+        );
+        res.json({ results });
+    } catch (err) {
+        console.log("⚠️ Brand lookup route failed:", err.message);
+        res.status(500).json({ error: "Couldn't load brands" });
+    }
+});
+
+app.get("/brands/medicines", async (req, res) => {
+    try {
+        res.json({
+            results: await brands.searchIngredients(String(req.query.q || "")),
+        });
+    } catch (err) {
+        res.status(500).json({ error: "Search failed" });
+    }
+});
+
+app.get("/brands/families", async (req, res) => {
+    try {
+        res.json(await brands.families(String(req.query.ing || "")));
+    } catch (err) {
+        res.status(500).json({ error: "Couldn't load brands" });
+    }
+});
+
+app.get("/brand-prefs", async (req, res) => {
+    try {
+        res.json({ prefs: await brands.listPrefs(req.userId) });
+    } catch (err) {
+        res.status(500).json({ error: "Couldn't load preferences" });
+    }
+});
+
+app.put("/brand-prefs", async (req, res) => {
+    try {
+        await brands.saveFavourites(
+            req.userId,
+            req.body?.ing_key,
+            req.body?.families,
+        );
+        res.json({ ok: true });
+    } catch (err) {
+        console.log("⚠️ Save brand prefs failed:", err.message);
+        res.status(400).json({ error: "Couldn't save" });
+    }
+});
+
+app.put("/brand-prefs/favourite", async (req, res) => {
+    try {
+        await brands.setFavourite(
+            req.userId,
+            req.body?.ing_key,
+            req.body?.family,
+            !!req.body?.favourite,
+        );
+        res.json({ ok: true });
+    } catch (err) {
+        console.log("⚠️ Favourite failed:", err.message);
+        res.status(400).json({ error: "Couldn't save" });
     }
 });
 const PORT = process.env.PORT || 8000;

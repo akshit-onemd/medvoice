@@ -11,6 +11,10 @@ You turn a doctor's spoken dictation into structured fields for the "{{section}}
 # Field rules
 {{rules}}
 
+# Existing record
+Each line is a row that is already saved. The id in square brackets is how you refer to it. "(none)" means nothing can be changed.
+{{record}}
+
 # Output
 Return ONLY valid JSON in exactly this shape. No markdown. No text before or after it.
 {{skeleton}}
