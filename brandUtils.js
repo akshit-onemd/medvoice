@@ -42,6 +42,38 @@ const SALTS = new Set([
     "furoate",
     "valerate",
     "lysine",
+    "decanoate",
+    "palmitate",
+    "estolate",
+    "trometamol",
+    "enantate",
+    "diacetate",
+    "disoproxil",
+    "mofetil",
+    "teoclate",
+    "undecanoate",
+    "acetonide",
+    "hexacetonide",
+    "micronized",
+    "microsize",
+    "polistirex",
+    "diethylammonium",
+    "semisodium",
+    "embonate",
+    "polacrilex",
+    "stearate",
+    "besilate",
+    "bisulfate",
+    "camsylate",
+    "mesilate",
+    "tosilate",
+    "napsylate",
+    "pamoate",
+    "oxalate",
+    "hydrate",
+    "sesquihydrate",
+    "bitartrate",
+    "dimesylate",
     "tromethamine",
 ]);
 // Spellings and US/Indian names that mean the same ingredient
@@ -62,6 +94,11 @@ const ALIAS = {
     "vitamin c": "ascorbic acid",
     thyroxine: "levothyroxine",
     "ethinyl estradiol": "ethinylestradiol",
+    aciclovir: "acyclovir",
+    chlorphenamine: "chlorpheniramine",
+    clomifene: "clomiphene",
+    ciclosporin: "cyclosporine",
+    colecalciferol: "cholecalciferol",
 };
 // Makers that sell generics under their own shop name. Not brands a doctor prescribes.
 const RETAILER_RE =
@@ -75,16 +112,38 @@ const clean = (s) =>
         .replace(/\s+/g, " ")
         .trim();
 
+// Bare anions: "sodium chloride" must not collapse to "chloride" and clash with "potassium chloride"
+const ANIONS = new Set([
+    "chloride",
+    "carbonate",
+    "bicarbonate",
+    "hydroxide",
+    "oxide",
+    "gluconate",
+    "lactate",
+    "nitrate",
+    "bromide",
+    "iodide",
+    "fluoride",
+]);
+const PHARMACOPOEIA = new Set(["ip", "bp", "usp", "ep", "nf"]);
+
 function canonIngredient(raw) {
-    const s = String(raw ?? "")
+    const words = String(raw ?? "")
         .toLowerCase()
         .replace(/\([^)]*\)/g, " ")
-        .replace(/[^a-z0-9 ]+/g, " ");
-    const out = s
+        .replace(/[^a-z0-9 ]+/g, " ")
         .split(/\s+/)
-        .filter((w) => w && !SALTS.has(w) && !/^\d+$/.test(w))
+        .filter((w) => w && !/^\d+$/.test(w));
+    let out = words
+        .filter((w) => !SALTS.has(w))
         .join(" ")
         .trim();
+    if (!out || ANIONS.has(out))
+        out = words
+            .filter((w) => !PHARMACOPOEIA.has(w))
+            .join(" ")
+            .trim();
     return ALIAS[out] || out;
 }
 

@@ -6,6 +6,12 @@ const fs = require("fs");
 const { pdf } = require("pdf-to-img");
 const app = express();
 const path = require("path");
+const {
+    registerConsentRoutes,
+    requireConsent,
+    requireConsentForConsultation,
+    consentStates,
+} = require("./consent");
 require("dotenv").config();
 const FormData = require("form-data");
 if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
@@ -48,6 +54,10 @@ app.use(async (req, res, next) => {
 const STAFF_ALLOWED = [
     ["GET", /^\/me$/],
     ["GET", /^\/patients\/search$/],
+    ["GET", /^\/consent\/notice$/],
+    ["GET", /^\/patients\/[0-9a-f-]{36}\/consent$/i],
+    ["POST", /^\/patients\/[0-9a-f-]{36}\/consent$/i],
+    ["POST", /^\/patients\/[0-9a-f-]{36}\/consent\/withdraw$/i],
     ["POST", /^\/patients$/],
     ["PUT", /^\/patients\/[0-9a-f-]{36}$/i],
     ["GET", /^\/patients$/],
@@ -72,6 +82,9 @@ const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY,
 );
+registerConsentRoutes(app, supabase);
+const consentGate = requireConsent(supabase);
+const consentGateByConsultation = requireConsentForConsultation(supabase);
 const staffCache = new Map(); // staffUserId -> { doctorId | null, at }
 const STAFF_TTL = 60 * 1000;
 const createBrands = require("./brands");
@@ -282,12 +295,10 @@ const terminology = createTerminology({
 const FIELD_VOCAB = {
     snomed_ct_code: "snomed",
     icd10_code: "icd10",
-    rxnorm_code: "rxnorm",
     loinc_code: "loinc",
     interpretation_snomed_code: "snomed",
 };
 const FIELD_KIND = {
-    rxnorm_code: "drug",
     loinc_code: "lab",
     interpretation_snomed_code: "interpretation",
 };
@@ -304,6 +315,7 @@ const verifiedFlag = (status) =>
     status === "verified" ? true : status === "review" ? null : false;
 
 function applyResult(target, key, res) {
+    delete target[`${key}_pending`];
     target[key] = res.code || "";
     target[`${key}_verified`] = verifiedFlag(res.status);
     target[`${key}_corrected`] = false;
@@ -315,25 +327,90 @@ function applyResult(target, key, res) {
 }
 
 // The model's own codes are ignored. Every code is looked up from the name.
-async function verifyEntry(entry, kind = "condition") {
+// opts.pending (an array): do not wait for the lookup. Use the answer if it is already known,
+// otherwise leave the code empty, mark it pending and add the job to the array.
+// opts.only (a Set of field names): look up just those fields.
+async function verifyEntry(entry, kind = "condition", opts = {}) {
     if (!entry || typeof entry !== "object") return;
     if ("icd10_pcs_code" in entry) entry.icd10_pcs_code = ""; // not coded
     for (const key of Object.keys(FIELD_VOCAB)) {
         if (!(key in entry)) continue;
+        if (opts.only && !opts.only.has(key)) continue;
         const term = termForField(entry, key);
         if (!term) {
             entry[key] = "";
             continue;
         }
-        applyResult(
-            entry,
-            key,
-            await terminology.resolve(
-                FIELD_VOCAB[key],
-                term,
-                FIELD_KIND[key] || kind,
-            ),
-        );
+        const vocab = FIELD_VOCAB[key];
+        const k = FIELD_KIND[key] || kind;
+        if (opts.pending) {
+            const hit = terminology.peek(vocab, term, k);
+            if (hit) applyResult(entry, key, hit);
+            else {
+                markPending(entry, key);
+                opts.pending.push({ vocab, text: term, kind: k });
+            }
+            continue;
+        }
+        applyResult(entry, key, await terminology.resolve(vocab, term, k));
+    }
+}
+
+// A code that is still being looked up. The screen shows no code chip until it arrives.
+function markPending(target, key) {
+    target[key] = "";
+    target[`${key}_pending`] = true;
+    for (const s of ["verified", "corrected", "umls_term", "status", "alts"])
+        delete target[`${key}_${s}`];
+    if (key === "snomed_ct_code" && "snomed_ct_term" in target)
+        target.snomed_ct_term = "";
+}
+const hasPending = (e) =>
+    !!e && Object.keys(e).some((k) => k.endsWith("_pending") && e[k]);
+
+const RX_KIND = { symptoms: "symptom", diagnosis: "diagnosis" };
+// Runs after the response has gone out. Looks the codes up together, then writes them in.
+async function fillPendingCodes(consultationId, owner, jobs) {
+    if (!jobs?.length) return;
+    try {
+        await terminology.warm(jobs);
+        const { data, error } = await supabase
+            .from("consultations")
+            .select("structured_data")
+            .eq("id", consultationId)
+            .eq("owner_id", owner)
+            .maybeSingle();
+        if (error || !data?.structured_data) return;
+        const sd = data.structured_data;
+        let changed = false;
+        const fix = async (list, kind) => {
+            for (const e of Array.isArray(list) ? list : []) {
+                if (!hasPending(e)) continue;
+                const only = new Set(
+                    Object.keys(FIELD_VOCAB).filter((k) => e[`${k}_pending`]),
+                );
+                try {
+                    await verifyEntry(e, kind, { only });
+                    changed = true;
+                } catch (err) {
+                    for (const k of only) delete e[`${k}_pending`];
+                    console.log("⚠️ Code lookup failed:", err.message);
+                }
+            }
+        };
+        for (const [k, kind] of Object.entries(RX_KIND))
+            await fix(sd.prescription?.[k], kind);
+        for (const [k, cfg] of Object.entries(SIMPLE_SECTIONS))
+            await fix(sd[k], cfg.kind);
+        if (!changed) return;
+        const { error: upErr } = await supabase
+            .from("consultations")
+            .update({ structured_data: sd })
+            .eq("id", consultationId)
+            .eq("owner_id", owner);
+        if (upErr) throw upErr;
+    } catch (err) {
+        console.log("⚠️ Filling codes failed:", err.message);
     }
 }
 
@@ -386,7 +463,18 @@ const KIND_BY_RX = {
     diagnosis: "diagnosis",
 };
 
+// Removes every rxnorm_* field, however it got there (the model, or an old record)
+function stripRxnorm(x) {
+    if (Array.isArray(x)) return x.forEach(stripRxnorm);
+    if (!x || typeof x !== "object") return;
+    for (const k of Object.keys(x)) {
+        if (k.startsWith("rxnorm")) delete x[k];
+        else stripRxnorm(x[k]);
+    }
+}
+
 async function verifyAllCodes(data) {
+    stripRxnorm(data);
     for (const [sectionName, section] of Object.entries(data)) {
         if (
             ["vitals", "consultation_summary", "suggested_plan"].includes(
@@ -442,7 +530,6 @@ function codeJobs(sd) {
         add("snomed", e?.name, "lifestyle"),
     );
     list(sd.social_history).forEach((e) => add("snomed", e?.name, "social"));
-    list(sd.medication_history).forEach((e) => add("rxnorm", e?.name, "drug"));
     list(sd.family_history).forEach((e) =>
         list(e?.illness).forEach((t) => both(t, "disorder")),
     );
@@ -459,7 +546,6 @@ function codeJobs(sd) {
     );
     const rx = sd.prescription || {};
     list(rx.symptoms).forEach((e) => add("snomed", e?.name, "symptom"));
-    list(rx.medications).forEach((e) => add("rxnorm", e?.name, "drug"));
     list(rx.diagnosis).forEach((e) => both(e?.name, "diagnosis"));
     return jobs;
 }
@@ -681,28 +767,15 @@ async function regenerateConsultationSummary(structuredData) {
         );
     }
 }
+// Saves and returns at once. The overview (and the patient summary under it) is rewritten
+// by POST /consultations/:id/summary/refresh, which the screen calls right after a save.
 async function afterConsultationEdit(consultationId, sd) {
-    const summary = await regenerateConsultationSummary(sd);
-    const updated = { ...sd, consultation_summary: summary };
-
     const { error } = await supabase
         .from("consultations")
-        .update({ structured_data: updated })
+        .update({ structured_data: sd })
         .eq("id", consultationId);
     if (error) throw error;
-
-    const { data: row } = await supabase
-        .from("consultations")
-        .select("patient_id")
-        .eq("id", consultationId)
-        .maybeSingle();
-    if (row?.patient_id) {
-        regeneratePatientSummary(row.patient_id).catch((err) =>
-            console.log("⚠️ Patient summary regeneration failed:", err.message),
-        );
-    }
-
-    return updated;
+    return sd;
 }
 function parseModelJson(text) {
     const s = String(text || "")
@@ -943,6 +1016,7 @@ app.post(
         { name: "file", maxCount: 1 },
         { name: "attachments", maxCount: 20 },
     ]),
+    consentGate,
     async (req, res) => {
         const startTime = Date.now();
         const audioFile = req.files?.file?.[0];
@@ -1167,7 +1241,17 @@ app.get("/patients/search", async (req, res) => {
         .or(`name.ilike.%${query}%,phone.ilike.%${phoneQ}%`)
         .limit(10);
     if (error) throw error;
-    res.json({ patients: data.map(withAge) });
+    const states = await consentStates(
+        supabase,
+        req.userId,
+        data.map((p) => p.id),
+    );
+    res.json({
+        patients: data.map((p) => ({
+            ...withAge(p),
+            consent_status: states[p.id] || "none",
+        })),
+    });
 });
 app.get("/patients/:id/consultations", async (req, res) => {
     const { id } = req.params;
@@ -1332,17 +1416,19 @@ const RX_FIELDS = {
 };
 const BLANK_CODES = {
     symptoms: { snomed_ct_code: "" },
-    medications: { rxnorm_code: "" },
+    medications: {},
     diagnosis: { snomed_ct_code: "", snomed_ct_term: "", icd10_code: "" },
     followup: {},
 };
-const CODE_KEY = /code|_verified|_corrected|umls_term|snomed_ct_term/;
+// Medicines carry no codes. Old rxnorm_* values are never copied forward.
+const CODE_KEY =
+    /^(?!rxnorm).*(code|_verified|_corrected|umls_term|snomed_ct_term)/;
 const str = (v, max = 300) =>
     typeof v === "string" ? v.trim().slice(0, max) : "";
 
 // Rebuild each entry from a whitelist. Existing codes are kept when the name is
 // unchanged; new or renamed entries get fresh codes looked up via UMLS.
-async function sanitizeRxList(key, incoming, existing) {
+async function sanitizeRxList(key, incoming, existing, pending) {
     if (!Array.isArray(incoming)) return [];
     const out = [];
     for (const raw of incoming.slice(0, 30)) {
@@ -1365,7 +1451,7 @@ async function sanitizeRxList(key, incoming, existing) {
             const prev = existing.find(
                 (e) => str(e?.name).toLowerCase() === entry.name.toLowerCase(),
             );
-            if (prev) {
+            if (prev && !hasPending(prev)) {
                 for (const k of Object.keys(prev)) {
                     if (CODE_KEY.test(k)) entry[k] = prev[k];
                 }
@@ -1379,6 +1465,7 @@ async function sanitizeRxList(key, incoming, existing) {
                             : key === "diagnosis"
                               ? "diagnosis"
                               : "symptom",
+                        { pending },
                     );
                 } catch (err) {
                     console.log(
@@ -1393,53 +1480,63 @@ async function sanitizeRxList(key, incoming, existing) {
     return out;
 }
 
-app.put("/consultations/:id/prescription", async (req, res) => {
-    try {
-        const { id } = req.params;
-        const incoming = req.body?.prescription;
-        if (!incoming || typeof incoming !== "object") {
-            return res.status(400).json({ error: "Invalid prescription data" });
+app.put(
+    "/consultations/:id/prescription",
+    consentGateByConsultation,
+    async (req, res) => {
+        try {
+            const { id } = req.params;
+            const incoming = req.body?.prescription;
+            if (!incoming || typeof incoming !== "object") {
+                return res
+                    .status(400)
+                    .json({ error: "Invalid prescription data" });
+            }
+
+            const { data: row, error } = await supabase
+                .from("consultations")
+                .select("structured_data")
+                .eq("id", id)
+                .eq("owner_id", req.userId)
+                .maybeSingle();
+            if (error) throw error;
+            if (!row) return res.status(404).json({ error: "Not found" });
+
+            const sd =
+                row.structured_data && typeof row.structured_data === "object"
+                    ? row.structured_data
+                    : {};
+            const existingRx = sd.prescription || {};
+
+            const cleaned = {};
+            const pending = []; // codes that are not known yet are looked up after we answer
+            for (const key of Object.keys(RX_FIELDS)) {
+                if (!(key in incoming)) continue; // older screens do not send tests
+                cleaned[key] = await sanitizeRxList(
+                    key,
+                    incoming[key],
+                    Array.isArray(existingRx[key]) ? existingRx[key] : [],
+                    pending,
+                );
+            }
+            const prescription = { ...existingRx, ...cleaned };
+            const updated = await afterConsultationEdit(id, {
+                ...sd,
+                prescription,
+            });
+            fillPendingCodes(id, req.userId, pending);
+
+            res.json({
+                prescription: updated.prescription,
+                consultation_summary: updated.consultation_summary,
+                codes_pending: pending.length > 0,
+            });
+        } catch (err) {
+            console.log("⚠️ Prescription update failed:", err.message);
+            res.status(500).json({ error: "Failed to save changes" });
         }
-
-        const { data: row, error } = await supabase
-            .from("consultations")
-            .select("structured_data")
-            .eq("id", id)
-            .eq("owner_id", req.userId)
-            .maybeSingle();
-        if (error) throw error;
-        if (!row) return res.status(404).json({ error: "Not found" });
-
-        const sd =
-            row.structured_data && typeof row.structured_data === "object"
-                ? row.structured_data
-                : {};
-        const existingRx = sd.prescription || {};
-
-        const cleaned = {};
-        for (const key of Object.keys(RX_FIELDS)) {
-            if (!(key in incoming)) continue; // older screens do not send tests
-            cleaned[key] = await sanitizeRxList(
-                key,
-                incoming[key],
-                Array.isArray(existingRx[key]) ? existingRx[key] : [],
-            );
-        }
-        const prescription = { ...existingRx, ...cleaned };
-        const updated = await afterConsultationEdit(id, {
-            ...sd,
-            prescription,
-        });
-
-        res.json({
-            prescription: updated.prescription,
-            consultation_summary: updated.consultation_summary,
-        });
-    } catch (err) {
-        console.log("⚠️ Prescription update failed:", err.message);
-        res.status(500).json({ error: "Failed to save changes" });
-    }
-});
+    },
+);
 const SIMPLE_SECTIONS = {
     allergies: {
         kind: "allergy",
@@ -1489,13 +1586,13 @@ const SIMPLE_SECTIONS = {
             "end_date",
             "status",
         ],
-        codeFields: ["rxnorm_code"],
+        codeFields: [],
         listField: "instruction",
     },
 };
 
 // Handles allergies, conditions, procedures, lifestyle, social, other, medications
-async function sanitizeSimpleList(config, incoming, existing) {
+async function sanitizeSimpleList(config, incoming, existing, pending) {
     if (!Array.isArray(incoming)) return [];
     const out = [];
     for (const raw of incoming.slice(0, 40)) {
@@ -1521,13 +1618,13 @@ async function sanitizeSimpleList(config, incoming, existing) {
         const prev = existing.find(
             (e) => str(e?.name).toLowerCase() === entry.name.toLowerCase(),
         );
-        if (prev) {
+        if (prev && !hasPending(prev)) {
             for (const k of Object.keys(prev))
                 if (CODE_KEY.test(k)) entry[k] = prev[k];
         } else {
             for (const cf of config.codeFields) entry[cf] = "";
             try {
-                await verifyEntry(entry, config.kind);
+                await verifyEntry(entry, config.kind, { pending });
             } catch (err) {
                 console.log(
                     "⚠️ Code lookup failed for edited entry:",
@@ -1701,66 +1798,77 @@ async function sanitizeInvestigations(incoming, existing) {
     return out;
 }
 
-app.put("/consultations/:id/section/:key", async (req, res) => {
-    const { id, key } = req.params;
-    try {
-        const { data: row, error } = await supabase
-            .from("consultations")
-            .select("structured_data")
-            .eq("id", id)
-            .eq("owner_id", req.userId)
-            .maybeSingle();
-        if (error) throw error;
-        if (!row) return res.status(404).json({ error: "Not found" });
+app.put(
+    "/consultations/:id/section/:key",
+    consentGateByConsultation,
+    async (req, res) => {
+        const { id, key } = req.params;
+        try {
+            const { data: row, error } = await supabase
+                .from("consultations")
+                .select("structured_data")
+                .eq("id", id)
+                .eq("owner_id", req.userId)
+                .maybeSingle();
+            if (error) throw error;
+            if (!row) return res.status(404).json({ error: "Not found" });
 
-        const sd =
-            row.structured_data && typeof row.structured_data === "object"
-                ? row.structured_data
-                : {};
-        const incoming = req.body?.[key];
-        let updatedSection;
-        if (key === "vitals") {
-            updatedSection = await sanitizeVitals(incoming, sd.vitals);
-        } else if (key === "family_history") {
-            updatedSection = await sanitizeFamilyHistory(
-                incoming,
-                Array.isArray(sd.family_history) ? sd.family_history : [],
-            );
-        } else if (key === "system_review") {
-            updatedSection = await sanitizeSystemReview(
-                incoming,
-                Array.isArray(sd.system_review) ? sd.system_review : [],
-            );
-        } else if (key === "investigation_history") {
-            updatedSection = await sanitizeInvestigations(
-                incoming,
-                Array.isArray(sd.investigation_history)
-                    ? sd.investigation_history
-                    : [],
-            );
-        } else if (SIMPLE_SECTIONS[key]) {
-            updatedSection = await sanitizeSimpleList(
-                SIMPLE_SECTIONS[key],
-                incoming,
-                Array.isArray(sd[key]) ? sd[key] : [],
-            );
-        } else {
-            return res.status(400).json({ error: "Unknown section" });
+            const sd =
+                row.structured_data && typeof row.structured_data === "object"
+                    ? row.structured_data
+                    : {};
+            const incoming = req.body?.[key];
+            const pending = [];
+            let updatedSection;
+            if (key === "vitals") {
+                updatedSection = await sanitizeVitals(incoming, sd.vitals);
+            } else if (key === "family_history") {
+                await warmCodes({ [key]: incoming }); // all lookups at once
+                updatedSection = await sanitizeFamilyHistory(
+                    incoming,
+                    Array.isArray(sd.family_history) ? sd.family_history : [],
+                );
+            } else if (key === "system_review") {
+                await warmCodes({ [key]: incoming });
+                updatedSection = await sanitizeSystemReview(
+                    incoming,
+                    Array.isArray(sd.system_review) ? sd.system_review : [],
+                );
+            } else if (key === "investigation_history") {
+                await warmCodes({ [key]: incoming });
+                updatedSection = await sanitizeInvestigations(
+                    incoming,
+                    Array.isArray(sd.investigation_history)
+                        ? sd.investigation_history
+                        : [],
+                );
+            } else if (SIMPLE_SECTIONS[key]) {
+                updatedSection = await sanitizeSimpleList(
+                    SIMPLE_SECTIONS[key],
+                    incoming,
+                    Array.isArray(sd[key]) ? sd[key] : [],
+                    pending,
+                );
+            } else {
+                return res.status(400).json({ error: "Unknown section" });
+            }
+            const updated = await afterConsultationEdit(id, {
+                ...sd,
+                [key]: updatedSection,
+            });
+            fillPendingCodes(id, req.userId, pending);
+
+            res.json({
+                [key]: updated[key],
+                consultation_summary: updated.consultation_summary,
+                codes_pending: pending.length > 0,
+            });
+        } catch (err) {
+            console.log(`⚠️ Section update failed (${key}):`, err.message);
+            res.status(500).json({ error: "Failed to save changes" });
         }
-        const updated = await afterConsultationEdit(id, {
-            ...sd,
-            [key]: updatedSection,
-        });
-
-        res.json({
-            [key]: updated[key],
-            consultation_summary: updated.consultation_summary,
-        });
-    } catch (err) {
-        console.log(`⚠️ Section update failed (${key}):`, err.message);
-        res.status(500).json({ error: "Failed to save changes" });
-    }
-});
+    },
+);
 app.put("/doctor/letterhead", async (req, res) => {
     try {
         const b = req.body || {};
@@ -2130,6 +2238,27 @@ app.put("/patients/:id", async (req, res) => {
         res.status(500).json({ error: "Failed to update patient" });
     }
 });
+
+// One patient with every stored field, for the details view
+app.get("/patients/:id", async (req, res) => {
+    try {
+        if (!/^[0-9a-f-]{36}$/i.test(req.params.id))
+            return res.status(404).json({ error: "Not found" });
+        const { data, error } = await supabase
+            .from("patients")
+            .select(PATIENT_COLS)
+            .eq("id", req.params.id)
+            .eq("owner_id", req.userId)
+            .maybeSingle();
+        if (error) throw error;
+        if (!data) return res.status(404).json({ error: "Not found" });
+        res.json({ patient: withAge(data) });
+    } catch (err) {
+        console.log("⚠️ Patient load failed:", err.message);
+        res.status(500).json({ error: "Failed to load patient" });
+    }
+});
+
 app.get("/patients", async (req, res) => {
     try {
         const limit = Math.min(
@@ -2162,7 +2291,18 @@ app.get("/patients", async (req, res) => {
                 }
                 return { ...r, visit_count: Number(r.visit_count) };
             });
-        res.json({ patients, hasMore });
+        const states = await consentStates(
+            supabase,
+            req.userId,
+            patients.map((p) => p.id),
+        );
+        res.json({
+            patients: patients.map((p) => ({
+                ...p,
+                consent_status: states[p.id] || "none",
+            })),
+            hasMore,
+        });
     } catch (err) {
         console.log("⚠️ Patient list failed:", err.message);
         res.status(500).json({ error: "Failed to load patients" });
@@ -3279,195 +3419,237 @@ const sdOf = (c) =>
         : {};
 
 // Build a plan for an older consultation, or rebuild one
-app.post("/consultations/:id/suggestion", async (req, res) => {
-    try {
-        const c = await loadConsultationFull(req.params.id, req.userId);
-        if (!c) return res.status(404).json({ error: "Not found" });
-        const sd = sdOf(c);
-        if (sd.suggested_plan?.status === "approved") {
-            return res
-                .status(409)
-                .json({ error: "A suggestion was already added" });
-        }
-        const { data: patient } = await supabase
-            .from("patients")
-            .select()
-            .eq("id", c.patient_id)
-            .eq("owner_id", req.userId)
-            .maybeSingle();
-        const plan = await generateSuggestion({
-            transcript: c.transcript,
-            patient,
-            sd,
-        });
-        if (!plan) {
-            return res.status(502).json({
+app.post(
+    "/consultations/:id/suggestion",
+    consentGateByConsultation,
+    async (req, res) => {
+        try {
+            const c = await loadConsultationFull(req.params.id, req.userId);
+            if (!c) return res.status(404).json({ error: "Not found" });
+            const sd = sdOf(c);
+            if (sd.suggested_plan?.status === "approved") {
+                return res
+                    .status(409)
+                    .json({ error: "A suggestion was already added" });
+            }
+            const { data: patient } = await supabase
+                .from("patients")
+                .select()
+                .eq("id", c.patient_id)
+                .eq("owner_id", req.userId)
+                .maybeSingle();
+            const plan = await generateSuggestion({
+                transcript: c.transcript,
+                patient,
+                sd,
+            });
+            if (!plan) {
+                return res.status(502).json({
+                    error: "Couldn't build a suggestion. Please try again.",
+                });
+            }
+            const { error } = await supabase
+                .from("consultations")
+                .update({ structured_data: { ...sd, suggested_plan: plan } })
+                .eq("id", c.id)
+                .eq("owner_id", req.userId);
+            if (error) throw error;
+            brands
+                .warm(
+                    plan.items
+                        .filter((i) => i.kind === "medication")
+                        .map((i) => ({ name: i.name, dosage: i.dosage })),
+                )
+                .catch(() => {});
+            res.json({ suggested_plan: plan });
+        } catch (err) {
+            console.log("⚠️ Suggestion route failed:", err.message);
+            res.status(500).json({
                 error: "Couldn't build a suggestion. Please try again.",
             });
         }
-        const { error } = await supabase
-            .from("consultations")
-            .update({ structured_data: { ...sd, suggested_plan: plan } })
-            .eq("id", c.id)
-            .eq("owner_id", req.userId);
-        if (error) throw error;
-        brands
-            .warm(
-                plan.items
-                    .filter((i) => i.kind === "medication")
-                    .map((i) => ({ name: i.name, dosage: i.dosage })),
-            )
-            .catch(() => {});
-        res.json({ suggested_plan: plan });
-    } catch (err) {
-        console.log("⚠️ Suggestion route failed:", err.message);
-        res.status(500).json({
-            error: "Couldn't build a suggestion. Please try again.",
-        });
-    }
-});
+    },
+);
 
 // Dismiss or bring back
-app.put("/consultations/:id/suggestion", async (req, res) => {
-    try {
-        const status = req.body?.status;
-        if (!["dismissed", "pending"].includes(status)) {
-            return res.status(400).json({ error: "Invalid status" });
+app.put(
+    "/consultations/:id/suggestion",
+    consentGateByConsultation,
+    async (req, res) => {
+        try {
+            const status = req.body?.status;
+            if (!["dismissed", "pending"].includes(status)) {
+                return res.status(400).json({ error: "Invalid status" });
+            }
+            const c = await loadConsultationFull(req.params.id, req.userId);
+            if (!c) return res.status(404).json({ error: "Not found" });
+            const sd = sdOf(c);
+            if (!sd.suggested_plan)
+                return res.status(404).json({ error: "No suggestion" });
+            if (sd.suggested_plan.status === "approved") {
+                return res.status(409).json({ error: "Already added" });
+            }
+            const next = { ...sd.suggested_plan, status };
+            const { error } = await supabase
+                .from("consultations")
+                .update({ structured_data: { ...sd, suggested_plan: next } })
+                .eq("id", c.id)
+                .eq("owner_id", req.userId);
+            if (error) throw error;
+            res.json({ suggested_plan: next });
+        } catch (err) {
+            console.log("⚠️ Suggestion status failed:", err.message);
+            res.status(500).json({ error: "Failed to update" });
         }
-        const c = await loadConsultationFull(req.params.id, req.userId);
-        if (!c) return res.status(404).json({ error: "Not found" });
-        const sd = sdOf(c);
-        if (!sd.suggested_plan)
-            return res.status(404).json({ error: "No suggestion" });
-        if (sd.suggested_plan.status === "approved") {
-            return res.status(409).json({ error: "Already added" });
-        }
-        const next = { ...sd.suggested_plan, status };
-        const { error } = await supabase
-            .from("consultations")
-            .update({ structured_data: { ...sd, suggested_plan: next } })
-            .eq("id", c.id)
-            .eq("owner_id", req.userId);
-        if (error) throw error;
-        res.json({ suggested_plan: next });
-    } catch (err) {
-        console.log("⚠️ Suggestion status failed:", err.message);
-        res.status(500).json({ error: "Failed to update" });
-    }
-});
+    },
+);
 
 // Add ticked items to the prescription
-app.post("/consultations/:id/suggestion/approve", async (req, res) => {
-    try {
-        const c = await loadConsultationFull(req.params.id, req.userId);
-        if (!c) return res.status(404).json({ error: "Not found" });
-        const sd = sdOf(c);
-        const plan = sd.suggested_plan;
-        if (!plan || !Array.isArray(plan.items)) {
-            return res.status(400).json({ error: "No suggestion to add" });
-        }
-        if (plan.status === "approved")
-            return res.status(409).json({ error: "Already added" });
+app.post(
+    "/consultations/:id/suggestion/approve",
+    consentGateByConsultation,
+    async (req, res) => {
+        try {
+            const c = await loadConsultationFull(req.params.id, req.userId);
+            if (!c) return res.status(404).json({ error: "Not found" });
+            const sd = sdOf(c);
+            const plan = sd.suggested_plan;
+            if (!plan || !Array.isArray(plan.items)) {
+                return res.status(400).json({ error: "No suggestion to add" });
+            }
+            if (plan.status === "approved")
+                return res.status(409).json({ error: "Already added" });
 
-        const ids = new Set(
-            Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [],
-        );
-        const picked = plan.items.filter((i) => ids.has(i.id));
-        if (!picked.length)
-            return res.status(400).json({ error: "Select at least one item" });
-        const brandMap =
-            req.body?.brands && typeof req.body.brands === "object"
-                ? req.body.brands
-                : {};
-        const brandUses = [];
-        const rx =
-            sd.prescription && typeof sd.prescription === "object"
-                ? sd.prescription
-                : {};
-        const cur = (k) => (Array.isArray(rx[k]) ? rx[k] : []);
-        const low = (v) =>
-            String(v || "")
-                .trim()
-                .toLowerCase();
-        const seen = (list, name) =>
-            list.some((e) => low(e?.name) === low(name));
+            const ids = new Set(
+                Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [],
+            );
+            const picked = plan.items.filter((i) => ids.has(i.id));
+            if (!picked.length)
+                return res
+                    .status(400)
+                    .json({ error: "Select at least one item" });
+            const brandMap =
+                req.body?.brands && typeof req.body.brands === "object"
+                    ? req.body.brands
+                    : {};
+            // A pick is a brand name, or { brand, name } when the doctor searched the database
+            // and chose a different product from the suggested one
+            const pickOf = (id) => {
+                const v = brandMap[id];
+                if (typeof v === "string")
+                    return { brand: pstr(v, 80), name: "" };
+                if (v && typeof v === "object")
+                    return {
+                        brand: pstr(
+                            typeof v.brand === "string" ? v.brand : "",
+                            80,
+                        ),
+                        name: pstr(
+                            typeof v.name === "string" ? v.name : "",
+                            120,
+                        ),
+                    };
+                return { brand: "", name: "" };
+            };
+            const brandUses = [];
+            const rx =
+                sd.prescription && typeof sd.prescription === "object"
+                    ? sd.prescription
+                    : {};
+            const cur = (k) => (Array.isArray(rx[k]) ? rx[k] : []);
+            const low = (v) =>
+                String(v || "")
+                    .trim()
+                    .toLowerCase();
+            const seen = (list, name) =>
+                list.some((e) => low(e?.name) === low(name));
 
-        const next = {
-            medications: [...cur("medications")],
-            diagnosis: [...cur("diagnosis")],
-            followup: [...cur("followup")],
-        };
-        for (const it of picked) {
-            if (it.kind === "medication") {
-                if (!seen(next.medications, it.name)) {
-                    const brand = pstr(
-                        typeof brandMap[it.id] === "string"
-                            ? brandMap[it.id]
-                            : "",
-                        80,
-                    );
-                    next.medications.push({
-                        name: it.name,
-                        duration: it.duration || "",
-                        dosage: Array.isArray(it.dosage) ? it.dosage : [],
-                        instructions: it.instructions || "",
-                        ...(brand ? { brand } : {}),
-                    });
-                    if (brand)
-                        brandUses.push({
-                            name: it.name,
-                            dosage: it.dosage,
-                            brand,
+            const next = {
+                medications: [...cur("medications")],
+                diagnosis: [...cur("diagnosis")],
+                followup: [...cur("followup")],
+            };
+            for (const it of picked) {
+                if (it.kind === "medication") {
+                    const pick = pickOf(it.id);
+                    const medName = pick.name || it.name;
+                    if (!seen(next.medications, medName)) {
+                        const brand = pick.brand;
+                        next.medications.push({
+                            name: medName,
+                            duration: it.duration || "",
+                            dosage: Array.isArray(it.dosage) ? it.dosage : [],
+                            instructions: it.instructions || "",
+                            ...(brand ? { brand } : {}),
                         });
-                }
-            } else if (it.kind === "diagnosis") {
-                if (!seen(next.diagnosis, it.name))
-                    next.diagnosis.push({ name: it.name });
-            } else if (it.kind === "followup") {
-                const dup = next.followup.some(
-                    (e) =>
-                        low(e?.advice) === low(it.advice) &&
-                        low(e?.next_visit_duration) ===
-                            low(it.next_visit_duration),
-                );
-                if (!dup) {
-                    next.followup.push({
-                        next_visit_duration: it.next_visit_duration || "",
-                        date: "",
-                        advice: it.advice || "",
-                    });
+                        if (brand)
+                            brandUses.push({
+                                name: medName,
+                                dosage: it.dosage,
+                                brand,
+                            });
+                    }
+                } else if (it.kind === "diagnosis") {
+                    if (!seen(next.diagnosis, it.name))
+                        next.diagnosis.push({ name: it.name });
+                } else if (it.kind === "followup") {
+                    const dup = next.followup.some(
+                        (e) =>
+                            low(e?.advice) === low(it.advice) &&
+                            low(e?.next_visit_duration) ===
+                                low(it.next_visit_duration),
+                    );
+                    if (!dup) {
+                        next.followup.push({
+                            next_visit_duration: it.next_visit_duration || "",
+                            date: "",
+                            advice: it.advice || "",
+                        });
+                    }
                 }
             }
-        }
 
-        // Same cleaning and code lookup your prescription editor uses
-        const cleaned = {};
-        for (const key of ["medications", "diagnosis", "followup"]) {
-            cleaned[key] = await sanitizeRxList(key, next[key], cur(key));
+            // Same cleaning and code lookup your prescription editor uses
+            const cleaned = {};
+            const pending = [];
+            for (const key of ["medications", "diagnosis", "followup"]) {
+                cleaned[key] = await sanitizeRxList(
+                    key,
+                    next[key],
+                    cur(key),
+                    pending,
+                );
+            }
+            const updated = await afterConsultationEdit(c.id, {
+                ...sd,
+                prescription: { ...rx, ...cleaned },
+                suggested_plan: {
+                    ...plan,
+                    status: "approved",
+                    approved_at: new Date().toISOString(),
+                    approved_ids: [...ids],
+                },
+            });
+            fillPendingCodes(c.id, req.userId, pending);
+            brandUses.forEach((b) =>
+                brands
+                    .bump(req.userId, b.name, b.dosage, b.brand)
+                    .catch(() => {}),
+            );
+            res.json({
+                prescription: updated.prescription,
+                suggested_plan: updated.suggested_plan,
+                consultation_summary: updated.consultation_summary,
+                codes_pending: pending.length > 0,
+            });
+        } catch (err) {
+            console.log("⚠️ Suggestion approve failed:", err.message);
+            res.status(500).json({
+                error: "Failed to add to the prescription",
+            });
         }
-        const updated = await afterConsultationEdit(c.id, {
-            ...sd,
-            prescription: { ...rx, ...cleaned },
-            suggested_plan: {
-                ...plan,
-                status: "approved",
-                approved_at: new Date().toISOString(),
-                approved_ids: [...ids],
-            },
-        });
-        brandUses.forEach((b) =>
-            brands.bump(req.userId, b.name, b.dosage, b.brand).catch(() => {}),
-        );
-        res.json({
-            prescription: updated.prescription,
-            suggested_plan: updated.suggested_plan,
-            consultation_summary: updated.consultation_summary,
-        });
-    } catch (err) {
-        console.log("⚠️ Suggestion approve failed:", err.message);
-        res.status(500).json({ error: "Failed to add to the prescription" });
-    }
-});
+    },
+);
 const voiceUpload = multer({
     dest: "uploads/",
     limits: { fileSize: 10 * 1024 * 1024 },
@@ -3972,7 +4154,7 @@ const VOICE_SECTIONS = {
   "other_history": [{ "name": "", "notes": "" }],
   "prescription": {
     "symptoms": [{ "name": "", "duration": "", "notes": "" }],
-    "medications": [{ "name": "", "duration": "", "dosage": [], "instructions": "" }],
+    "medications": [{ "name": "", "brand": "", "duration": "", "dosage": [], "instructions": "" }],
     "diagnosis": [{ "name": "" }],
     "followup": [{ "next_visit_duration": "", "date": "", "advice": "" }]
   },
@@ -3980,7 +4162,7 @@ const VOICE_SECTIONS = {
 }`,
         rules: `Where each thing goes:
 - Today's complaint, what brings the patient in now with how long: prescription.symptoms. "name", "duration", "notes".
-- Medicines the doctor prescribes today: prescription.medications. "name" (with strength if said, for example "Paracetamol 500 mg"), "duration" (for example "5 days"), "dosage" (a list of short strings, for example ["1-0-1"] or ["twice daily"]), "instructions" (for example "after food").
+- Medicines the doctor prescribes today: prescription.medications. "name" is the generic name with strength if said, for example "Paracetamol 500 mg". If the doctor says a brand name, put it in "brand" exactly as said without "Tab" or "Cap", and the generic in "name" only if you are certain of it. If you are not certain of the generic, put the brand as said in "name" and leave "brand" empty. If only a generic is said, leave "brand" empty. Never make up a brand. "duration" (for example "5 days"), "dosage" (a list of short strings, for example ["1-0-1"] or ["twice daily"]), "instructions" (for example "after food").
 - Diagnosis the doctor states today: prescription.diagnosis, "name".
 - Follow-up: prescription.followup. "next_visit_duration" is how long until the next visit, for example "3 days". "date" only when a specific calendar date is said, written like "25 Oct 2026". Today is {{today}}. "advice" holds advice for the patient, including tests the doctor tells the patient to get.
 - Medicines the patient already takes or took before today: medication_history. "name", "dosage" (short text), "duration", "status" (for example "Ongoing" or "Stopped"), "instruction" (a list).
@@ -4058,6 +4240,24 @@ app.post(
         ),
     async (req, res) => {
         const file = req.file;
+        if (req.body.consultation_id) {
+            const { data: c } = await supabase
+                .from("consultations")
+                .select("patient_id")
+                .eq("id", req.body.consultation_id)
+                .eq("owner_id", req.userId)
+                .maybeSingle();
+            const st = c
+                ? (await consentStates(supabase, req.userId, [c.patient_id]))[
+                      c.patient_id
+                  ]
+                : "none";
+            if (st !== "valid")
+                return res.status(403).json({
+                    error: "Patient consent is required before this action.",
+                    code: "CONSENT_REQUIRED",
+                });
+        }
         try {
             const spec = VOICE_SECTIONS[String(req.body?.section || "all")];
             if (!spec)
@@ -4164,173 +4364,195 @@ app.post(
         }
     },
 );
-app.post("/consultations/:id/voice/apply", async (req, res) => {
-    try {
-        const c = await loadConsultationFull(req.params.id, req.userId);
-        if (!c) return res.status(404).json({ error: "Not found" });
+app.post(
+    "/consultations/:id/voice/apply",
+    consentGateByConsultation,
+    async (req, res) => {
+        try {
+            const c = await loadConsultationFull(req.params.id, req.userId);
+            if (!c) return res.status(404).json({ error: "Not found" });
 
-        const rows = VOICE_SECTIONS.all.clean(req.body?.rows); // never trust the browser's shape
-        const sd = sdOf(c);
+            const rows = VOICE_SECTIONS.all.clean(req.body?.rows); // never trust the browser's shape
+            const sd = sdOf(c);
 
-        // Every change is checked against the record as it is now, and against the value the doctor saw
-        const index = buildEditIndex(sd);
-        const rawEdits = Array.isArray(req.body?.edits)
-            ? req.body.edits.slice(0, 40)
-            : [];
-        const sentOld = new Map(
-            rawEdits.map((e) => [
-                `${vStr(e?.id, 80)}|${vStr(e?.field, 40)}`,
-                asText(e?.old),
-            ]),
-        );
-        const edits = findEdits(rawEdits, index).filter(
-            (e) => flat(sentOld.get(`${e.id}|${e.field}`)) === flat(e.old),
-        );
-        if (edits.length < rawEdits.length)
-            console.log(
-                `voice apply: skipped ${rawEdits.length - edits.length} change(s)`,
+            // Every change is checked against the record as it is now, and against the value the doctor saw
+            const index = buildEditIndex(sd);
+            const rawEdits = Array.isArray(req.body?.edits)
+                ? req.body.edits.slice(0, 40)
+                : [];
+            const sentOld = new Map(
+                rawEdits.map((e) => [
+                    `${vStr(e?.id, 80)}|${vStr(e?.field, 40)}`,
+                    asText(e?.old),
+                ]),
             );
-        if (countRows(rows) === 0 && edits.length === 0) {
-            return res
-                .status(400)
-                .json({
+            const edits = findEdits(rawEdits, index).filter(
+                (e) => flat(sentOld.get(`${e.id}|${e.field}`)) === flat(e.old),
+            );
+            if (edits.length < rawEdits.length)
+                console.log(
+                    `voice apply: skipped ${rawEdits.length - edits.length} change(s)`,
+                );
+            if (countRows(rows) === 0 && edits.length === 0) {
+                return res.status(400).json({
                     error: "Nothing to apply. The record may have changed. Try again.",
                 });
-        }
+            }
 
-        const t0 = Date.now();
-        await warmCodes(withEditedNames(rows, edits)); // all lookups at once
-        const tLookup = Date.now() - t0;
-
-        const next = { ...sd };
-        const patch = {};
-        const arrOf = (k) => (Array.isArray(sd[k]) ? sd[k] : []);
-        const editsFor = (sec) => edits.filter((e) => e.sec === sec);
-        const withEdits = (list, sec) => {
-            const out = list.map((x) =>
-                x && typeof x === "object" ? { ...x } : x,
-            );
-            editsFor(sec).forEach((e) => {
-                if (out[e.i] && typeof out[e.i] === "object")
-                    out[e.i][e.field] = e.value;
+            const t0 = Date.now();
+            // Medicines, diagnoses and the simple history lists are coded after we answer.
+            // The other sections still need their codes now, so look those up together.
+            const named = withEditedNames(rows, edits);
+            await warmCodes({
+                family_history: named.family_history,
+                system_review: named.system_review,
+                investigation_history: named.investigation_history,
             });
-            return out;
-        };
+            const pending = [];
+            const tLookup = Date.now() - t0;
 
-        for (const key of [
-            "allergies",
-            "conditions",
-            "medication_history",
-            "procedures",
-            "lifestyle_habits",
-            "social_history",
-            "other_history",
-        ]) {
-            if (!rows[key].length && !editsFor(key).length) continue;
-            patch[key] = next[key] = await sanitizeSimpleList(
-                SIMPLE_SECTIONS[key],
-                [...withEdits(arrOf(key), key), ...rows[key]],
-                arrOf(key),
+            const next = { ...sd };
+            const patch = {};
+            const arrOf = (k) => (Array.isArray(sd[k]) ? sd[k] : []);
+            const editsFor = (sec) => edits.filter((e) => e.sec === sec);
+            const withEdits = (list, sec) => {
+                const out = list.map((x) =>
+                    x && typeof x === "object" ? { ...x } : x,
+                );
+                editsFor(sec).forEach((e) => {
+                    if (out[e.i] && typeof out[e.i] === "object")
+                        out[e.i][e.field] = e.value;
+                });
+                return out;
+            };
+
+            for (const key of [
+                "allergies",
+                "conditions",
+                "medication_history",
+                "procedures",
+                "lifestyle_habits",
+                "social_history",
+                "other_history",
+            ]) {
+                if (!rows[key].length && !editsFor(key).length) continue;
+                patch[key] = next[key] = await sanitizeSimpleList(
+                    SIMPLE_SECTIONS[key],
+                    [...withEdits(arrOf(key), key), ...rows[key]],
+                    arrOf(key),
+                    pending,
+                );
+            }
+            if (
+                rows.family_history.length ||
+                editsFor("family_history").length
+            ) {
+                patch.family_history = next.family_history =
+                    await sanitizeFamilyHistory(
+                        [
+                            ...withEdits(
+                                arrOf("family_history"),
+                                "family_history",
+                            ),
+                            ...rows.family_history,
+                        ],
+                        arrOf("family_history"),
+                    );
+            }
+            if (rows.system_review.length || editsFor("system_review").length) {
+                patch.system_review = next.system_review =
+                    await sanitizeSystemReview(
+                        [
+                            ...withEdits(
+                                arrOf("system_review"),
+                                "system_review",
+                            ),
+                            ...rows.system_review,
+                        ],
+                        arrOf("system_review"),
+                    );
+            }
+
+            const readingEdits = editsFor("investigation_history.readings");
+            if (rows.investigation_history.length || readingEdits.length) {
+                const base = arrOf("investigation_history").map((inv) => ({
+                    ...inv,
+                    readings: (Array.isArray(inv?.readings)
+                        ? inv.readings
+                        : []
+                    ).map((r) => ({ ...r })),
+                }));
+                readingEdits.forEach((e) => {
+                    const r = base[e.i]?.readings?.[e.j];
+                    if (r) r[e.field] = e.value;
+                });
+                patch.investigation_history = next.investigation_history =
+                    await sanitizeInvestigations(
+                        [...base, ...rows.investigation_history],
+                        arrOf("investigation_history"),
+                    );
+            }
+
+            const vitalsIn = [
+                ...rows.vitals,
+                ...editsFor("vitals")
+                    .map((e) => ({
+                        name: arrOf("vitals")[e.i]?.name,
+                        value: e.value,
+                    }))
+                    .filter((v) => v.name),
+            ];
+            if (vitalsIn.length)
+                patch.vitals = next.vitals = await sanitizeVitals(
+                    vitalsIn,
+                    sd.vitals,
+                );
+
+            const rxIn = rows.prescription;
+            const rx =
+                sd.prescription && typeof sd.prescription === "object"
+                    ? sd.prescription
+                    : {};
+            const cur = (k) => (Array.isArray(rx[k]) ? rx[k] : []);
+            const cleaned = {};
+            for (const key of [
+                "symptoms",
+                "medications",
+                "diagnosis",
+                "followup",
+            ]) {
+                const sec = `prescription.${key}`;
+                if (!rxIn[key].length && !editsFor(sec).length) continue;
+                cleaned[key] = await sanitizeRxList(
+                    key,
+                    [...withEdits(cur(key), sec), ...rxIn[key]],
+                    cur(key),
+                    pending,
+                );
+            }
+            if (Object.keys(cleaned).length)
+                patch.prescription = next.prescription = { ...rx, ...cleaned };
+
+            const { error: saveErr } = await supabase
+                .from("consultations")
+                .update({ structured_data: next })
+                .eq("id", c.id)
+                .eq("owner_id", req.userId);
+            if (saveErr) throw saveErr;
+
+            console.log(
+                `voice apply: lookups ${tLookup} ms, total ${Date.now() - t0} ms`,
             );
-        }
-        if (rows.family_history.length || editsFor("family_history").length) {
-            patch.family_history = next.family_history =
-                await sanitizeFamilyHistory(
-                    [
-                        ...withEdits(arrOf("family_history"), "family_history"),
-                        ...rows.family_history,
-                    ],
-                    arrOf("family_history"),
-                );
-        }
-        if (rows.system_review.length || editsFor("system_review").length) {
-            patch.system_review = next.system_review =
-                await sanitizeSystemReview(
-                    [
-                        ...withEdits(arrOf("system_review"), "system_review"),
-                        ...rows.system_review,
-                    ],
-                    arrOf("system_review"),
-                );
-        }
-
-        const readingEdits = editsFor("investigation_history.readings");
-        if (rows.investigation_history.length || readingEdits.length) {
-            const base = arrOf("investigation_history").map((inv) => ({
-                ...inv,
-                readings: (Array.isArray(inv?.readings)
-                    ? inv.readings
-                    : []
-                ).map((r) => ({ ...r })),
-            }));
-            readingEdits.forEach((e) => {
-                const r = base[e.i]?.readings?.[e.j];
-                if (r) r[e.field] = e.value;
+            fillPendingCodes(c.id, req.userId, pending);
+            res.json({ patch, codes_pending: pending.length > 0 }); // the overview refreshes separately
+        } catch (err) {
+            console.log("⚠️ Voice apply failed:", err.message);
+            res.status(500).json({
+                error: "Couldn't add to the record. Please try again.",
             });
-            patch.investigation_history = next.investigation_history =
-                await sanitizeInvestigations(
-                    [...base, ...rows.investigation_history],
-                    arrOf("investigation_history"),
-                );
         }
-
-        const vitalsIn = [
-            ...rows.vitals,
-            ...editsFor("vitals")
-                .map((e) => ({
-                    name: arrOf("vitals")[e.i]?.name,
-                    value: e.value,
-                }))
-                .filter((v) => v.name),
-        ];
-        if (vitalsIn.length)
-            patch.vitals = next.vitals = await sanitizeVitals(
-                vitalsIn,
-                sd.vitals,
-            );
-
-        const rxIn = rows.prescription;
-        const rx =
-            sd.prescription && typeof sd.prescription === "object"
-                ? sd.prescription
-                : {};
-        const cur = (k) => (Array.isArray(rx[k]) ? rx[k] : []);
-        const cleaned = {};
-        for (const key of [
-            "symptoms",
-            "medications",
-            "diagnosis",
-            "followup",
-        ]) {
-            const sec = `prescription.${key}`;
-            if (!rxIn[key].length && !editsFor(sec).length) continue;
-            cleaned[key] = await sanitizeRxList(
-                key,
-                [...withEdits(cur(key), sec), ...rxIn[key]],
-                cur(key),
-            );
-        }
-        if (Object.keys(cleaned).length)
-            patch.prescription = next.prescription = { ...rx, ...cleaned };
-
-        const { error: saveErr } = await supabase
-            .from("consultations")
-            .update({ structured_data: next })
-            .eq("id", c.id)
-            .eq("owner_id", req.userId);
-        if (saveErr) throw saveErr;
-
-        console.log(
-            `voice apply: lookups ${tLookup} ms, total ${Date.now() - t0} ms`,
-        );
-        res.json({ patch }); // the overview refreshes separately
-    } catch (err) {
-        console.log("⚠️ Voice apply failed:", err.message);
-        res.status(500).json({
-            error: "Couldn't add to the record. Please try again.",
-        });
-    }
-});
+    },
+);
 async function refreshSummary(consultationId, owner) {
     const c = await loadConsultationFull(consultationId, owner);
     if (!c) return null;
@@ -4358,20 +4580,23 @@ async function refreshSummary(consultationId, owner) {
     return summary;
 }
 
-app.post("/consultations/:id/summary/refresh", async (req, res) => {
-    try {
-        const summary = await refreshSummary(req.params.id, req.userId);
-        if (!summary) return res.status(404).json({ error: "Not found" });
-        res.json({ consultation_summary: summary });
-    } catch (err) {
-        console.log("⚠️ Summary refresh failed:", err.message);
-        res.status(500).json({ error: "Couldn't refresh the summary" });
-    }
-});
+app.post(
+    "/consultations/:id/summary/refresh",
+    consentGateByConsultation,
+    async (req, res) => {
+        try {
+            const summary = await refreshSummary(req.params.id, req.userId);
+            if (!summary) return res.status(404).json({ error: "Not found" });
+            res.json({ consultation_summary: summary });
+        } catch (err) {
+            console.log("⚠️ Summary refresh failed:", err.message);
+            res.status(500).json({ error: "Couldn't refresh the summary" });
+        }
+    },
+);
 const CODE_FIELDS = new Set([
     "snomed_ct_code",
     "icd10_code",
-    "rxnorm_code",
     "loinc_code",
     "interpretation_snomed_code",
 ]);
@@ -4454,7 +4679,7 @@ function applyConfirmed(loc, code, term) {
 app.get("/codes/search", async (req, res) => {
     try {
         const vocab = String(req.query.vocab || "");
-        if (!["snomed", "icd10", "rxnorm", "loinc"].includes(vocab)) {
+        if (!["snomed", "icd10", "loinc"].includes(vocab)) {
             return res.status(400).json({ error: "Unknown vocabulary" });
         }
         res.json({
@@ -4479,68 +4704,74 @@ app.get("/codes/health", async (req, res) => {
 });
 
 // Confirm, or swap, one or more codes
-app.put("/consultations/:id/code", async (req, res) => {
-    try {
-        const c = await loadConsultationFull(req.params.id, req.userId);
-        if (!c) return res.status(404).json({ error: "Not found" });
-        const changes = Array.isArray(req.body?.changes)
-            ? req.body.changes.slice(0, 60)
-            : [];
-        if (!changes.length)
-            return res.status(400).json({ error: "Nothing to change" });
+app.put(
+    "/consultations/:id/code",
+    consentGateByConsultation,
+    async (req, res) => {
+        try {
+            const c = await loadConsultationFull(req.params.id, req.userId);
+            if (!c) return res.status(404).json({ error: "Not found" });
+            const changes = Array.isArray(req.body?.changes)
+                ? req.body.changes.slice(0, 60)
+                : [];
+            if (!changes.length)
+                return res.status(400).json({ error: "Nothing to change" });
 
-        const sd = JSON.parse(JSON.stringify(sdOf(c)));
-        for (const ch of changes) {
-            const loc = locateCode(sd, ch?.path);
-            if (!loc)
-                return res.status(400).json({ error: "Invalid code location" });
-            const code = String(ch?.code ?? "").trim();
-            if (!/^[A-Za-z0-9.\-]{1,40}$/.test(code))
-                return res.status(400).json({ error: "Invalid code" });
+            const sd = JSON.parse(JSON.stringify(sdOf(c)));
+            for (const ch of changes) {
+                const loc = locateCode(sd, ch?.path);
+                if (!loc)
+                    return res
+                        .status(400)
+                        .json({ error: "Invalid code location" });
+                const code = String(ch?.code ?? "").trim();
+                if (!/^[A-Za-z0-9.\-]{1,40}$/.test(code))
+                    return res.status(400).json({ error: "Invalid code" });
 
-            const stored =
-                loc.index === null
-                    ? loc.owner[loc.key]
-                    : loc.owner[loc.key]?.[loc.index];
-            let term;
-            if (stored === code) {
-                // Confirming the code already shown. No lookup needed.
-                term =
-                    (loc.index === null
-                        ? loc.owner[`${loc.key}_umls_term`]
-                        : loc.owner[`${loc.key}_terms`]?.[loc.index]) || "";
-            } else {
-                const found = await terminology.exists(
-                    vocabOfField(loc.key),
-                    code,
-                );
-                if (!found.ok)
-                    return res.status(502).json({
-                        error: "The code service is not reachable. Try again.",
-                    });
-                if (!found.name)
-                    return res.status(400).json({
-                        error: `Code ${code} was not found. Pick one from the list.`,
-                    });
-                term = found.name;
+                const stored =
+                    loc.index === null
+                        ? loc.owner[loc.key]
+                        : loc.owner[loc.key]?.[loc.index];
+                let term;
+                if (stored === code) {
+                    // Confirming the code already shown. No lookup needed.
+                    term =
+                        (loc.index === null
+                            ? loc.owner[`${loc.key}_umls_term`]
+                            : loc.owner[`${loc.key}_terms`]?.[loc.index]) || "";
+                } else {
+                    const found = await terminology.exists(
+                        vocabOfField(loc.key),
+                        code,
+                    );
+                    if (!found.ok)
+                        return res.status(502).json({
+                            error: "The code service is not reachable. Try again.",
+                        });
+                    if (!found.name)
+                        return res.status(400).json({
+                            error: `Code ${code} was not found. Pick one from the list.`,
+                        });
+                    term = found.name;
+                }
+                applyConfirmed(loc, code, term);
             }
-            applyConfirmed(loc, code, term);
-        }
 
-        const { error } = await supabase
-            .from("consultations")
-            .update({ structured_data: sd })
-            .eq("id", c.id)
-            .eq("owner_id", req.userId);
-        if (error) throw error;
-        res.json({ structured_data: sd });
-    } catch (err) {
-        console.log("⚠️ Code update failed:", err.message);
-        res.status(500).json({
-            error: "Couldn't save the code. Please try again.",
-        });
-    }
-});
+            const { error } = await supabase
+                .from("consultations")
+                .update({ structured_data: sd })
+                .eq("id", c.id)
+                .eq("owner_id", req.userId);
+            if (error) throw error;
+            res.json({ structured_data: sd });
+        } catch (err) {
+            console.log("⚠️ Code update failed:", err.message);
+            res.status(500).json({
+                error: "Couldn't save the code. Please try again.",
+            });
+        }
+    },
+);
 app.post("/brands/lookup", async (req, res) => {
     try {
         const items = Array.isArray(req.body?.items)
@@ -4575,6 +4806,17 @@ app.get("/brands/medicines", async (req, res) => {
             results: await brands.searchIngredients(String(req.query.q || "")),
         });
     } catch (err) {
+        res.status(500).json({ error: "Search failed" });
+    }
+});
+
+app.get("/brands/products", async (req, res) => {
+    try {
+        res.json({
+            results: await brands.searchProducts(String(req.query.q || "")),
+        });
+    } catch (err) {
+        console.log("⚠️ Product search failed:", err.message);
         res.status(500).json({ error: "Search failed" });
     }
 });

@@ -1417,5 +1417,12 @@ ${JSON.stringify(part)}`);
         return out;
     }
 
-    return { resolve, warm, searchCodes, exists, health };
+    // Cached result only. Never calls the network. null when this term has not been looked up yet.
+    function peek(vocab, text, kind = "condition") {
+        const t = clean(text);
+        if (!t) return EMPTY;
+        return cacheGet(keyOf(vocab, kind, t)) || null;
+    }
+
+    return { resolve, peek, warm, searchCodes, exists, health };
 };

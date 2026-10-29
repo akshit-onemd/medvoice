@@ -82,7 +82,6 @@
     "medication_history": [
         {
             "name": "",
-            "rxnorm_code": "",
             "dosage": "",
             "duration": "",
             "start_date": "",
@@ -155,7 +154,7 @@
         "medications": [
             {
                 "name": "",
-                "rxnorm_code": "",
+                "brand": "",
                 "duration": "",
                 "dosage": [],
                 "instructions": ""

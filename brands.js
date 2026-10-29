@@ -10,6 +10,10 @@ const {
     isModified,
 } = require("./brandUtils");
 
+// Which brand tables to read. Leave unset for the old tables; set both to the _v2 names to switch.
+const BRANDS_TABLE = process.env.BRANDS_TABLE || "drug_brands";
+const INGREDIENTS_TABLE = process.env.INGREDIENTS_TABLE || "drug_ingredients";
+
 const SHOW = 3;
 const LEARN_FROM_APPROVALS = true; // each approved brand nudges its rank up
 const PRIOR_CANDIDATES = 60; // how many real brands the model sees
@@ -218,7 +222,7 @@ ${list.map((c, i) => `${i + 1}. ${c.brand} (${c.manufacturer || "unknown maker"}
         const comp = compKey(p.ings);
 
         let q = supabase
-            .from("drug_brands")
+            .from(BRANDS_TABLE)
             .select("brand, manufacturer, form, price, prominence, composition")
             .eq("discontinued", false);
         q = comp ? q.eq("comp_key", comp) : q.eq("ing_key", ing);
@@ -363,15 +367,53 @@ ${list.map((c, i) => `${i + 1}. ${c.brand} (${c.manufacturer || "unknown maker"}
         const found = new Map();
         for (const term of terms) {
             const { data } = await supabase
-                .from("drug_ingredients")
+                .from(INGREDIENTS_TABLE)
                 .select("ing_key, label, brand_count")
                 .ilike("ing_key", `%${term}%`)
                 .order("brand_count", { ascending: false })
                 .limit(12);
             (data || []).forEach((r) => found.set(r.ing_key, r));
         }
+
+        // Brand-name search: "crocin" finds the medicine that brand contains.
+        const viaBrand = new Map(); // ing_key -> matched brand name
+        const { data: bd } = await supabase
+            .from(BRANDS_TABLE)
+            .select("ing_key, brand, prominence")
+            .ilike("brand", `%${t}%`)
+            .eq("discontinued", false)
+            .order("prominence", { ascending: false })
+            .limit(60);
+        for (const r of bd || []) {
+            if (!r.ing_key || viaBrand.has(r.ing_key)) continue;
+            viaBrand.set(r.ing_key, r.brand);
+        }
+        const missing = [...viaBrand.keys()].filter((k) => !found.has(k));
+        if (missing.length) {
+            const { data: ings } = await supabase
+                .from(INGREDIENTS_TABLE)
+                .select("ing_key, label, brand_count")
+                .in("ing_key", missing.slice(0, 20));
+            (ings || []).forEach((r) => found.set(r.ing_key, r));
+        }
+
+        const startsWith = (name) =>
+            String(name || "")
+                .toLowerCase()
+                .startsWith(t);
         return [...found.values()]
-            .sort((a, b) => b.brand_count - a.brand_count)
+            .map((r) => ({
+                ...r,
+                matched_brand: viaBrand.get(r.ing_key) || null,
+            }))
+            .sort((a, c) => {
+                // brand name starting with the query first, then by size
+                const as =
+                    a.matched_brand && startsWith(a.matched_brand) ? 1 : 0;
+                const cs =
+                    c.matched_brand && startsWith(c.matched_brand) ? 1 : 0;
+                return cs - as || c.brand_count - a.brand_count;
+            })
             .slice(0, 12);
     }
 
@@ -379,7 +421,7 @@ ${list.map((c, i) => `${i + 1}. ${c.brand} (${c.manufacturer || "unknown maker"}
     async function families(ing) {
         if (!ingOk(ing)) return { ing_key: ing, label: ing, families: [] };
         const { data, error } = await supabase
-            .from("drug_brands")
+            .from(BRANDS_TABLE)
             .select("brand, manufacturer, comp_key, composition, prominence")
             .eq("ing_key", ing)
             .eq("discontinued", false)
@@ -402,7 +444,7 @@ ${list.map((c, i) => `${i + 1}. ${c.brand} (${c.manufacturer || "unknown maker"}
             map.get(fam).strengths.add(r.comp_key.replace(`${ing} `, ""));
         }
         const { data: lab } = await supabase
-            .from("drug_ingredients")
+            .from(INGREDIENTS_TABLE)
             .select("label")
             .eq("ing_key", ing)
             .maybeSingle();
@@ -433,7 +475,7 @@ ${list.map((c, i) => `${i + 1}. ${c.brand} (${c.manufacturer || "unknown maker"}
         const labels = new Map();
         if (keys.length) {
             const { data: l } = await supabase
-                .from("drug_ingredients")
+                .from(INGREDIENTS_TABLE)
                 .select("ing_key, label")
                 .in("ing_key", keys);
             (l || []).forEach((r) => labels.set(r.ing_key, r.label));
@@ -534,8 +576,99 @@ ${list.map((c, i) => `${i + 1}. ${c.brand} (${c.manufacturer || "unknown maker"}
         );
     }
 
+    // "sitagliptin 100mg + metformin 1000mg" -> "Sitagliptin 100 mg + Metformin 1000 mg"
+    function genericLabel(ck) {
+        const title = (s) => s.replace(/\b[a-z]/g, (c) => c.toUpperCase());
+        return String(ck || "")
+            .split(" + ")
+            .map((part) => {
+                const m = /^(.*?)\s+(\d[^\s]*)$/.exec(part.trim());
+                if (!m) return title(part.trim());
+                const strength = m[2]
+                    .replace(/(\d)(mg|mcg|g|iu|units|ml|l)\b/g, "$1 $2")
+                    .replace(/\biu\b/g, "IU");
+                return `${title(m[1])} ${strength}`;
+            })
+            .join(" + ");
+    }
+
+    // Product search for the prescription: finds by brand OR generic name, optional strength.
+    // "metformin 500" -> Glycomet 500, Gluconorm ... each with the generic written out.
+    async function searchProducts(q) {
+        const raw = String(q || "")
+            .toLowerCase()
+            .replace(/[^a-z0-9 .+\-]/g, " ");
+        const tokens = raw.split(/\s+/).filter(Boolean);
+        const words = tokens
+            .filter(
+                (t) =>
+                    /[a-z]/.test(t) && !/^\d+(\.\d+)?(mg|mcg|g|iu|ml)$/.test(t),
+            )
+            .join(" ")
+            .replace(/[+\-]/g, " ")
+            .trim()
+            .slice(0, 50);
+        const nums = tokens
+            .filter((t) => /^\d+(\.\d+)?(mg|mcg|g|iu|ml)?$/.test(t))
+            .map((t) => t.replace(/(mg|mcg|g|iu|ml)$/, ""));
+        if (words.length < 2) return [];
+        const canon = canonIngredient(words);
+        const terms = [
+            ...new Set([words, canon].filter((x) => x && x.length >= 2)),
+        ];
+
+        const fetchBy = async (col, term) => {
+            const { data } = await supabase
+                .from(BRANDS_TABLE)
+                .select(
+                    "brand, manufacturer, comp_key, ing_key, composition, form, prominence",
+                )
+                .ilike(col, `%${term}%`)
+                .eq("discontinued", false)
+                .order("prominence", { ascending: false })
+                .limit(150);
+            return data || [];
+        };
+        const batches = await Promise.all(
+            terms.flatMap((t) => [fetchBy("brand", t), fetchBy("ing_key", t)]),
+        );
+
+        const seen = new Map();
+        for (const r of batches.flat()) {
+            if (!r.comp_key || !r.brand) continue;
+            if (genericLabelled(r.brand, r.composition, r.manufacturer))
+                continue;
+            const hay = `${r.comp_key} ${r.brand}`.toLowerCase();
+            if (
+                nums.length &&
+                !nums.every((n) =>
+                    new RegExp(
+                        `(^|[^0-9.])${n.replace(".", "\\.")}(?![0-9])`,
+                    ).test(hay),
+                )
+            )
+                continue;
+            const k = `${r.brand.toLowerCase()}|${r.comp_key}`;
+            if (!seen.has(k)) seen.set(k, r);
+        }
+        const starts = (r) => (r.brand.toLowerCase().startsWith(words) ? 1 : 0);
+        return [...seen.values()]
+            .sort(
+                (a, b) => starts(b) - starts(a) || b.prominence - a.prominence,
+            )
+            .slice(0, 25)
+            .map((r) => ({
+                brand: r.brand,
+                generic: genericLabel(r.comp_key),
+                manufacturer: r.manufacturer || "",
+                form: r.form || "",
+                ing_key: r.ing_key,
+            }));
+    }
+
     return {
         lookupOne,
+        searchProducts,
         searchIngredients,
         families,
         listPrefs,
