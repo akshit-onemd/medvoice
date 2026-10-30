@@ -602,7 +602,11 @@ ${list.map((c, i) => `${i + 1}. ${c.brand} (${c.manufacturer || "unknown maker"}
         const words = tokens
             .filter(
                 (t) =>
-                    /[a-z]/.test(t) && !/^\d+(\.\d+)?(mg|mcg|g|iu|ml)$/.test(t),
+                    /[a-z]/.test(t) &&
+                    !/^\d+(\.\d+)?(mg|mcg|g|iu|ml)$/.test(t) &&
+                    !/^(mg|mcg|g|gm|iu|ml|tab|tabs|tablet|tablets|cap|caps|capsule|capsules)$/.test(
+                        t,
+                    ),
             )
             .join(" ")
             .replace(/[+\-]/g, " ")

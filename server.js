@@ -4228,6 +4228,116 @@ async function parseVoice(spec, heard, record = "(none)") {
     return null;
 }
 
+// The model tends to turn a spoken brand ("Atorva 40 mg") into its generic. This looks at what was
+// actually said and finds the brand in the drug database, so the doctor gets the brand back.
+const SPOKEN_SKIP = new Set(
+    "tablet tablets tab tabs capsule capsules cap caps syrup injection once twice daily morning night evening noon after before food meal meals breakfast lunch dinner sleep days day weeks week months month years take taking give prescribe prescribed medicine medicines also and the for with this that next then same continue repeat".split(
+        " ",
+    ),
+);
+const SPOKEN_SUFFIX =
+    /^(\d+(\.\d+)?|xr|sr|er|mr|cr|dt|plus|forte|duo|m|d|am|h|ds|cv|l|ls|f|gp|mf|trio)$/i;
+const rxNums = (s) =>
+    (String(s || "").match(/\d+(?:\.\d+)?/g) || []).map((n) =>
+        String(Number(n)),
+    );
+async function recoverSpokenBrands(meds, heard) {
+    if (!Array.isArray(meds) || !meds.length || !heard) return;
+    const todo = meds.filter(
+        (m) => m && m.name && !String(m.brand || "").trim(),
+    );
+    if (!todo.length) return;
+    const toks =
+        String(heard).match(/[A-Za-z][A-Za-z0-9.\-]*|\d+(?:\.\d+)?/g) || [];
+    const cands = [];
+    const seen = new Set();
+    const add = (c) => {
+        const k = c.toLowerCase();
+        if (!seen.has(k)) {
+            seen.add(k);
+            cands.push(c);
+        }
+    };
+    toks.forEach((w, i) => {
+        if (!/^[A-Za-z]/.test(w) || w.length < 4) return;
+        if (SPOKEN_SKIP.has(w.toLowerCase())) return;
+        const n1 = toks[i + 1];
+        const n2 = toks[i + 2];
+        if (n1 && SPOKEN_SUFFIX.test(n1)) {
+            if (n2 && SPOKEN_SUFFIX.test(n2)) add(`${w} ${n1} ${n2}`);
+            add(`${w} ${n1}`);
+        }
+        add(w);
+    });
+    const batch = cands.slice(0, 14);
+    const found = await Promise.all(
+        batch.map((c) =>
+            brands.searchProducts(c).then(
+                (h) => ({ c, hits: h || [] }),
+                () => ({ c, hits: [] }),
+            ),
+        ),
+    );
+    for (const m of todo) {
+        const base = String(m.name)
+            .toLowerCase()
+            .match(/[a-z]{4,}/)?.[0];
+        if (!base) continue;
+        const nums = rxNums(m.name);
+        let best = null;
+        let suggest = "";
+        for (const { c, hits } of found) {
+            const cw = c.toLowerCase().split(" ")[0];
+            if (cw.startsWith(base)) continue; // the generic itself, not a brand
+            const ok = hits.filter(
+                (h) =>
+                    h.brand.toLowerCase().startsWith(cw.slice(0, 5)) &&
+                    String(h.generic || "")
+                        .toLowerCase()
+                        .includes(base),
+            );
+            if (!ok.length) continue;
+            if (!suggest) suggest = c;
+            const exact = nums.length
+                ? ok.filter((h) => {
+                      const g = rxNums(h.generic);
+                      return nums.every((n) => g.includes(n));
+                  })
+                : [];
+            if (exact.length) {
+                best = exact[0];
+                break;
+            }
+        }
+        // The model sometimes leaves the brand as the name. Look the name itself up as a brand.
+        if (!best) {
+            try {
+                const hits = (await brands.searchProducts(m.name)).filter((h) =>
+                    h.brand.toLowerCase().startsWith(base.slice(0, 5)),
+                );
+                if (hits.length) {
+                    const exact = nums.length
+                        ? hits.filter((h) => {
+                              const g = rxNums(`${h.brand} ${h.generic}`);
+                              return nums.every((n) => g.includes(n));
+                          })
+                        : [];
+                    if (exact.length) best = exact[0];
+                    else if (!suggest) suggest = m.name;
+                }
+            } catch {
+                /* the picker still opens */
+            }
+        }
+        if (best) {
+            m.brand = best.brand;
+            m.name = best.generic || m.name;
+        } else if (suggest) {
+            m.spoken = suggest; // the picker opens on what was said
+        }
+    }
+}
+
 app.post(
     "/voice/parse",
     (req, res, next) =>
@@ -4318,6 +4428,14 @@ app.post(
                 });
             }
             const rows = parsed.rows;
+            try {
+                await recoverSpokenBrands(
+                    rows.prescription?.medications,
+                    heard,
+                );
+            } catch (err) {
+                console.log("⚠️ Spoken brand match failed:", err.message);
+            }
             const rawEdits = Array.isArray(parsed.edits)
                 ? [...parsed.edits]
                 : [];
