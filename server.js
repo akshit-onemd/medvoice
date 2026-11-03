@@ -903,6 +903,27 @@ function suggestionContext(sd) {
         "Vitals",
         j(sd.vitals, (v) => v?.value && `${v.name} ${v.value}${v.units || ""}`),
     );
+    add(
+        "Investigation results",
+        j(sd.investigation_history, (i) =>
+            j(
+                i?.readings,
+                (r) =>
+                    r?.investigation_name &&
+                    `${r.investigation_name} ${r.result || ""}${r.unit ? ` ${r.unit}` : ""}${r.interpretation ? ` (${r.interpretation})` : ""}`,
+            ),
+        ),
+    );
+    add(
+        "Examination findings",
+        j(sd.system_review, (e) =>
+            j(e?.findings, (f) => (typeof f === "string" ? f : f?.finding)),
+        ),
+    );
+    add(
+        "Diagnosis already noted",
+        j(sd.prescription?.diagnosis, (e) => e?.name),
+    );
     return lines.join("\n");
 }
 
@@ -965,14 +986,20 @@ function cleanSuggestion(obj) {
 // Returns a suggested plan or null. Never throws.
 async function generateSuggestion({ transcript, patient, sd }) {
     try {
-        if (!transcript || transcript.length < 40) return null;
-        const ctx = [patientContext(patient), suggestionContext(sd || {})]
+        const hasTalk = !!transcript && transcript.length >= 40;
+        const record = suggestionContext(sd || {});
+        // Reports only: no recording, so the plan is built from what the reports showed
+        if (!hasTalk && record.length < 40) return null;
+        const ctx = [patientContext(patient), record]
             .filter(Boolean)
             .join("\n");
+        const spoken = hasTalk
+            ? transcript
+            : 'No conversation was recorded for this visit. The record above comes from uploaded reports or documents. Base the plan only on what those reports show. Suggest nothing the reports do not support, and say in "note" that no conversation was recorded.';
         const base = fs
             .readFileSync("suggested-plan-prompt.md", "utf-8")
             .replace("{{patient_context}}", () => ctx || "None recorded")
-            .replace("{{transcript}}", () => transcript);
+            .replace("{{transcript}}", () => spoken);
 
         for (let attempt = 0; attempt < 2; attempt++) {
             try {
@@ -1580,6 +1607,7 @@ const SIMPLE_SECTIONS = {
         kind: "drug",
         fields: [
             "name",
+            "brand",
             "dosage",
             "duration",
             "start_date",
