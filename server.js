@@ -3794,6 +3794,7 @@ function cleanAllVoice(obj) {
         if (!name) continue;
         medication_history.push({
             name,
+            brand: vStr(e?.brand, 80),
             dosage: vStr(asText(e?.dosage), 80),
             duration: vStr(e?.duration, 60),
             status: vStr(e?.status, 40),
@@ -3926,6 +3927,7 @@ const EDIT_SECTIONS = [
         title: (e) => e.name,
         fields: {
             name: TX("Name"),
+            brand: TX("Brand", 80),
             dosage: TX("Dosage", 80),
             duration: TX("Duration", 60),
             status: TX("Status", 40),
@@ -4172,7 +4174,7 @@ const VOICE_SECTIONS = {
   "vitals": [{ "name": "", "value": "" }],
   "allergies": [{ "name": "", "notes": "" }],
   "conditions": [{ "name": "", "duration": "", "notes": "" }],
-  "medication_history": [{ "name": "", "dosage": "", "duration": "", "status": "", "instruction": [] }],
+  "medication_history": [{ "name": "", "brand": "", "dosage": "", "duration": "", "status": "", "instruction": [] }],
   "investigation_history": [{ "name": "", "date": "", "readings": [{ "investigation_name": "", "result": "", "unit": "", "interpretation": "", "notes": "" }] }],
   "procedures": [{ "name": "", "date": "", "notes": "" }],
   "system_review": [{ "name": "", "findings": [], "notes": "" }],
@@ -4193,7 +4195,7 @@ const VOICE_SECTIONS = {
 - Medicines the doctor prescribes today: prescription.medications. "name" is the generic name with strength if said, for example "Paracetamol 500 mg". If the doctor says a brand name, put it in "brand" exactly as said without "Tab" or "Cap", and the generic in "name" only if you are certain of it. If you are not certain of the generic, put the brand as said in "name" and leave "brand" empty. If only a generic is said, leave "brand" empty. Never make up a brand. "duration" (for example "5 days"), "dosage" (a list of short strings, for example ["1-0-1"] or ["twice daily"]), "instructions" (for example "after food").
 - Diagnosis the doctor states today: prescription.diagnosis, "name".
 - Follow-up: prescription.followup. "next_visit_duration" is how long until the next visit, for example "3 days". "date" only when a specific calendar date is said, written like "25 Oct 2026". Today is {{today}}. "advice" holds advice for the patient, including tests the doctor tells the patient to get.
-- Medicines the patient already takes or took before today: medication_history. "name", "dosage" (short text), "duration", "status" (for example "Ongoing" or "Stopped"), "instruction" (a list).
+- Medicines the patient already takes or took before today: medication_history. "name" is the generic name with strength if said. If a brand name is said, put it in "brand" exactly as said without "Tab" or "Cap", and the generic in "name" only if you are certain of it. If you are not certain of the generic, put the brand as said in "name" and leave "brand" empty. Never make up a brand. "dosage" (short text), "duration", "status" (for example "Ongoing" or "Stopped"), "instruction" (a list).
 - Long-term or past illnesses: conditions. "name", "duration", "notes".
 - Allergies: allergies. "name", "notes" (for example the reaction).
 - Past operations or procedures: procedures. "name", "date", "notes".
@@ -4461,6 +4463,7 @@ app.post(
                     rows.prescription?.medications,
                     heard,
                 );
+                await recoverSpokenBrands(rows.medication_history, heard);
             } catch (err) {
                 console.log("⚠️ Spoken brand match failed:", err.message);
             }
