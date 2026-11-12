@@ -88,6 +88,7 @@ const consentGateByConsultation = requireConsentForConsultation(supabase);
 const staffCache = new Map(); // staffUserId -> { doctorId | null, at }
 const STAFF_TTL = 60 * 1000;
 const createBrands = require("./brands");
+const llm = require("./llm");
 const brands = createBrands({ supabase, llmJson });
 async function lookupDoctorForStaff(userId) {
     const hit = staffCache.get(userId);
@@ -257,24 +258,12 @@ async function transcribeWithElevenLabs(filePath, originalName, mimetype) {
 async function llmJson(prompt) {
     for (let attempt = 0; attempt < 2; attempt++) {
         try {
-            const payload = {
-                model: "gemma4:31b-cloud",
-                prompt,
-                stream: false,
-                options: { temperature: 0 }, // same input, same answer
-            };
-            if (attempt > 0) payload.format = "json"; // unconfirmed for this model. Delete if it causes a 400.
-            const r = await axios.post(
-                "https://ollama.com/api/generate",
-                payload,
-                {
-                    headers: {
-                        Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
-                    },
-                    timeout: 90000,
-                },
-            );
-            const obj = parseModelJson(r.data?.response);
+            const text = await llm.generate(prompt, {
+                temperature: 0, // same input, same answer
+                json: attempt > 0,
+                timeout: 90000,
+            });
+            const obj = parseModelJson(text);
             if (obj) return obj;
         } catch (err) {
             console.log(
@@ -513,6 +502,177 @@ async function verifyAllCodes(data) {
     return data;
 }
 
+// ---- Codes and plan after the record is saved ----
+// Every code field: snomed_ct_code, icd10_codes_verified, loinc_code_status, snomed_ct_term ...
+const CODE_FIELD =
+    /^(snomed_ct|icd10|icd10_pcs|loinc|interpretation_snomed)_(code|codes|term)(_.+)?$/;
+const NOT_CODED = new Set(["vitals", "consultation_summary", "suggested_plan"]);
+const PENDING_STALE_MS = 3 * 60 * 1000;
+
+// Empties every code the model wrote, so nothing shows until the real lookup is done
+function blankCodes(sd) {
+    const walk = (x) => {
+        if (Array.isArray(x)) return x.forEach(walk);
+        if (!x || typeof x !== "object") return;
+        for (const k of Object.keys(x)) {
+            const m = k.match(CODE_FIELD);
+            if (m) {
+                if (m[3]) delete x[k];
+                else x[k] = Array.isArray(x[k]) ? [] : "";
+            } else walk(x[k]);
+        }
+    };
+    for (const [k, v] of Object.entries(sd)) if (!NOT_CODED.has(k)) walk(v);
+}
+
+const idOf = (e) =>
+    String(
+        typeof e === "string"
+            ? e
+            : (e?.name ??
+                  e?.investigation_name ??
+                  e?.finding ??
+                  e?.relationship ??
+                  ""),
+    )
+        .trim()
+        .toLowerCase();
+// True when an entry already has codes from somewhere else (a doctor's edit, a manual pick)
+const alreadyCoded = (o) =>
+    Object.keys(o).some((k) => {
+        const m = k.match(CODE_FIELD);
+        if (!m) return false;
+        if (m[3] === "_pending" || m[3] === "_status") return !!o[k];
+        if (m[3]) return false;
+        return Array.isArray(o[k]) ? o[k].some(Boolean) : !!o[k];
+    });
+
+// Copies the looked-up codes into the record as it is now. Entries are matched by name, so
+// anything the doctor removed or renamed in the meantime is left alone.
+function mergeCodeFields(fresh, coded) {
+    const walk = (f, c) => {
+        if (Array.isArray(f) && Array.isArray(c)) {
+            const used = new Set();
+            f.forEach((fe, i) => {
+                const key = idOf(fe);
+                if (!key) return;
+                let j =
+                    c[i] !== undefined && !used.has(i) && idOf(c[i]) === key
+                        ? i
+                        : -1;
+                if (j < 0)
+                    j = c.findIndex(
+                        (ce, k) => !used.has(k) && idOf(ce) === key,
+                    );
+                if (j < 0) return;
+                used.add(j);
+                walk(fe, c[j]);
+            });
+            return;
+        }
+        if (!f || !c || typeof f !== "object" || typeof c !== "object") return;
+        // Family history codes line up with the illness list, so it must be unchanged
+        const sameShape =
+            !Array.isArray(f.illness) ||
+            JSON.stringify(f.illness) === JSON.stringify(c.illness);
+        const copy = sameShape && !alreadyCoded(f);
+        for (const k of Object.keys(c)) {
+            if (CODE_FIELD.test(k)) {
+                if (copy) f[k] = c[k];
+            } else if (c[k] && typeof c[k] === "object") walk(f[k], c[k]);
+        }
+    };
+    for (const k of Object.keys(coded))
+        if (!NOT_CODED.has(k)) walk(fresh[k], coded[k]);
+}
+
+// Reads the saved record, lets fn change it, writes it back. fn returns false to skip.
+async function patchStructured(consultationId, owner, fn) {
+    const { data, error } = await supabase
+        .from("consultations")
+        .select("structured_data")
+        .eq("id", consultationId)
+        .eq("owner_id", owner)
+        .maybeSingle();
+    if (error) throw error;
+    if (!data?.structured_data) return;
+    const sd = data.structured_data;
+    if (fn(sd) === false) return;
+    const { error: upErr } = await supabase
+        .from("consultations")
+        .update({ structured_data: sd })
+        .eq("id", consultationId)
+        .eq("owner_id", owner);
+    if (upErr) throw upErr;
+}
+
+// Runs after the doctor already has the record. Codes and the plan are worked out side by side
+// and written in one at a time, so the two writes never overwrite each other.
+function finishInBackground(
+    consultationId,
+    owner,
+    extracted,
+    { transcript, patient },
+) {
+    const t0 = Date.now();
+    let chain = Promise.resolve();
+    const write = (label, fn) => {
+        chain = chain
+            .then(() => patchStructured(consultationId, owner, fn))
+            .then(() =>
+                console.log(
+                    `🧩 ${label} ready in ${((Date.now() - t0) / 1000).toFixed(1)}s`,
+                ),
+            )
+            .catch((err) =>
+                console.log(`⚠️ Saving ${label} failed:`, err.message),
+            );
+        return chain;
+    };
+
+    const coded = JSON.parse(JSON.stringify(extracted));
+    (async () => {
+        try {
+            await warmCodes(coded);
+            await verifyAllCodes(coded);
+        } catch (err) {
+            console.log(
+                "⚠️ Code lookup failed, keeping what was found:",
+                err.message,
+            );
+        }
+        write("codes", (sd) => {
+            mergeCodeFields(sd, coded);
+            delete sd.codes_pending_since;
+        });
+    })();
+
+    Promise.race([
+        generateSuggestion({ transcript, patient, sd: extracted }),
+        sleep(120000).then(() => null),
+    ])
+        .catch(() => null)
+        .then((plan) =>
+            write("plan", (sd) => {
+                // The doctor asked for a new one, or dismissed it, in the meantime
+                if (sd.suggested_plan?.status !== "generating") return false;
+                if (plan) {
+                    sd.suggested_plan = plan;
+                    brands
+                        .warm(
+                            plan.items
+                                .filter((i) => i.kind === "medication")
+                                .map((i) => ({
+                                    name: i.name,
+                                    dosage: i.dosage,
+                                })),
+                        )
+                        .catch(() => {});
+                } else delete sd.suggested_plan;
+            }),
+        );
+}
+
 // Every (vocabulary, term) the record needs, so lookups run together
 function codeJobs(sd) {
     const jobs = [];
@@ -580,16 +740,8 @@ async function regeneratePatientSummary(patientId) {
         prompt = prompt.replace("{{consultation_summaries}}", formatted);
 
         try {
-            const ollamaResponse = await axios.post(
-                "https://ollama.com/api/generate",
-                { model: "gemma4:31b-cloud", prompt, stream: false },
-                {
-                    headers: {
-                        Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
-                    },
-                },
-            );
-            let rawResponse = ollamaResponse.data.response.trim();
+            const reply = await llm.generate(prompt, { timeout: 90000 });
+            let rawResponse = reply.trim();
             rawResponse = rawResponse
                 .replace(/```json/g, "")
                 .replace(/```/g, "")
@@ -737,16 +889,8 @@ async function regenerateConsultationSummary(structuredData) {
     prompt = prompt.replace("{{record}}", record);
 
     try {
-        const ollamaResponse = await axios.post(
-            "https://ollama.com/api/generate",
-            { model: "gemma4:31b-cloud", prompt, stream: false },
-            {
-                headers: {
-                    Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
-                },
-            },
-        );
-        let raw = ollamaResponse.data.response
+        const reply = await llm.generate(prompt, { timeout: 90000 });
+        let raw = reply
             .trim()
             .replace(/```json/g, "")
             .replace(/```/g, "")
@@ -811,30 +955,13 @@ async function extractStructured(basePrompt, images) {
     let lastErr = new Error("No attempt made");
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         try {
-            const payload = {
-                model: "gemma4:31b-cloud",
-                prompt:
-                    attempt === 0
-                        ? basePrompt
-                        : `${basePrompt}\n\nIMPORTANT: Your previous reply could not be read. Reply with exactly one valid JSON object that follows the template. No text before or after it.`,
-                images,
-                stream: false,
-            };
-            // Retries ask Ollama for strict JSON. I have not confirmed this model honors it.
-            // If retries start failing with a 400, delete the next line.
-            if (attempt > 0) payload.format = "json";
-
-            const r = await axios.post(
-                "https://ollama.com/api/generate",
-                payload,
-                {
-                    headers: {
-                        Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
-                    },
-                    timeout: 180000,
-                },
+            const text = await llm.generate(
+                attempt === 0
+                    ? basePrompt
+                    : `${basePrompt}\n\nIMPORTANT: Your previous reply could not be read. Reply with exactly one valid JSON object that follows the template. No text before or after it.`,
+                { images: images || [], json: attempt > 0, timeout: 180000 },
             );
-            const obj = parseModelJson(r.data?.response);
+            const obj = parseModelJson(text);
             if (obj && EXPECTED_KEYS.some((k) => k in obj)) return obj;
             lastErr = new Error("The model reply was not usable JSON");
         } catch (err) {
@@ -1003,26 +1130,13 @@ async function generateSuggestion({ transcript, patient, sd }) {
 
         for (let attempt = 0; attempt < 2; attempt++) {
             try {
-                const payload = {
-                    model: "gemma4:31b-cloud",
-                    prompt:
-                        attempt === 0
-                            ? base
-                            : `${base}\n\nIMPORTANT: Your previous reply could not be read. Reply with exactly one valid JSON object. Nothing else.`,
-                    stream: false,
-                };
-                if (attempt > 0) payload.format = "json"; // unconfirmed for this model. Delete if it causes a 400.
-                const r = await axios.post(
-                    "https://ollama.com/api/generate",
-                    payload,
-                    {
-                        headers: {
-                            Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
-                        },
-                        timeout: 90000,
-                    },
+                const text = await llm.generate(
+                    attempt === 0
+                        ? base
+                        : `${base}\n\nIMPORTANT: Your previous reply could not be read. Reply with exactly one valid JSON object. Nothing else.`,
+                    { json: attempt > 0, timeout: 90000 },
                 );
-                const plan = cleanSuggestion(parseModelJson(r.data?.response));
+                const plan = cleanSuggestion(parseModelJson(text));
                 if (plan) return plan;
             } catch (err) {
                 console.log(
@@ -1111,6 +1225,12 @@ app.post(
                 return res.status(404).json({ error: "Patient not found" });
 
             // ---- 1. Transcribe (skipped on a transcript retry) ----
+            const tm = {};
+            let tStep = Date.now();
+            const lap = (k) => {
+                tm[k] = ((Date.now() - tStep) / 1000).toFixed(1);
+                tStep = Date.now();
+            };
             if (audioFile && !fromTranscript) {
                 const fns = {
                     sarvam: transcribeWithSarvam,
@@ -1136,6 +1256,7 @@ app.post(
             }
             if (!transcript && attachmentFiles.length === 0)
                 return fail("transcribe");
+            lap("transcribe");
 
             // ---- 2. Build the prompt ----
             const template = fs.readFileSync("template.json", "utf-8");
@@ -1162,6 +1283,7 @@ app.post(
                 }
             }
 
+            lap("prepare");
             // ---- 3. Summary, with automatic retries ----
             let structuredData;
             try {
@@ -1176,36 +1298,18 @@ app.post(
                 );
                 return fail("summarize");
             }
-            // Runs while codes are verified. Capped at 60 seconds.
-            const planPromise = generateSuggestion({
-                transcript,
-                patient,
-                sd: structuredData,
-            });
-            // ---- 4. Code verification. Never blocks. ----
-            try {
-                await warmCodes(structuredData);
-                structuredData = await verifyAllCodes(structuredData);
-            } catch (err) {
-                console.log(
-                    "⚠️ Code lookup failed, keeping what was found:",
-                    err.message,
-                );
-            }
-            const plan = await Promise.race([
-                planPromise,
-                sleep(60000).then(() => null),
-            ]);
-            if (plan) {
-                structuredData.suggested_plan = plan;
-                brands
-                    .warm(
-                        plan.items
-                            .filter((i) => i.kind === "medication")
-                            .map((i) => ({ name: i.name, dosage: i.dosage })),
-                    )
-                    .catch(() => {});
-            } // ---- 5. Save ----
+            lap("extract");
+            // ---- 4. Codes and the plan come after saving (see finishInBackground) ----
+            stripRxnorm(structuredData);
+            blankCodes(structuredData);
+            const extracted = JSON.parse(JSON.stringify(structuredData));
+            const now = new Date().toISOString();
+            structuredData.codes_pending_since = now;
+            structuredData.suggested_plan = {
+                status: "generating",
+                started_at: now,
+            };
+            // ---- 5. Save ----
             const { data: consultation, error: saveError } = await supabase
                 .from("consultations")
                 .insert({
@@ -1223,6 +1327,10 @@ app.post(
                 return fail("other", 500);
             }
 
+            finishInBackground(consultation.id, req.userId, extracted, {
+                transcript,
+                patient,
+            });
             regeneratePatientSummary(patient.id).catch((err) =>
                 console.log(
                     "⚠️ Patient summary regeneration failed:",
@@ -1230,7 +1338,12 @@ app.post(
                 ),
             );
 
-            console.log(`✅ Done in ${(Date.now() - startTime) / 1000}s`);
+            console.log(
+                `✅ Done in ${(Date.now() - startTime) / 1000}s · ` +
+                    Object.entries(tm)
+                        .map(([k, v]) => `${k} ${v}s`)
+                        .join(" · "),
+            );
             return res.json({
                 language,
                 transcript,
@@ -1986,6 +2099,31 @@ app.get("/me", async (req, res) => {
     } catch (err) {
         console.log("⚠️ /me failed:", err.message);
         res.status(500).json({ error: "Couldn't load account" });
+    }
+});
+
+// Doctor's display settings. show_codes: whether medical codes appear in the app.
+app.put("/doctor/settings", async (req, res) => {
+    try {
+        const b = req.body || {};
+        if (typeof b.show_codes !== "boolean")
+            return res.status(400).json({ error: "Nothing to save" });
+        const { data, error } = await supabase
+            .from("doctors")
+            .update({
+                show_codes: b.show_codes,
+                updated_at: new Date().toISOString(),
+            })
+            .eq("owner_id", req.userId)
+            .select()
+            .maybeSingle();
+        if (error) throw error;
+        if (!data)
+            return res.status(404).json({ error: "Set up your profile first" });
+        res.json({ profile: data });
+    } catch (err) {
+        console.log("⚠️ Settings save failed:", err.message);
+        res.status(500).json({ error: "Couldn't save the setting" });
     }
 });
 
@@ -4226,26 +4364,13 @@ async function parseVoice(spec, heard, record = "(none)") {
 
     for (let attempt = 0; attempt < 2; attempt++) {
         try {
-            const payload = {
-                model: "gemma4:31b-cloud",
-                prompt:
-                    attempt === 0
-                        ? base
-                        : `${base}\n\nIMPORTANT: Your previous reply could not be read. Reply with exactly one valid JSON object. Nothing else.`,
-                stream: false,
-            };
-            if (attempt > 0) payload.format = "json";
-            const r = await axios.post(
-                "https://ollama.com/api/generate",
-                payload,
-                {
-                    headers: {
-                        Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
-                    },
-                    timeout: 60000,
-                },
+            const text = await llm.generate(
+                attempt === 0
+                    ? base
+                    : `${base}\n\nIMPORTANT: Your previous reply could not be read. Reply with exactly one valid JSON object. Nothing else.`,
+                { json: attempt > 0, timeout: 60000 },
             );
-            const obj = parseModelJson(r.data?.response);
+            const obj = parseModelJson(text);
             if (obj) return { rows: spec.clean(obj), edits: obj.edits };
         } catch (err) {
             console.log(
