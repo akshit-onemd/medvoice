@@ -219,6 +219,61 @@ function registerConsentRoutes(app, supabase) {
         }
     });
 
+    // The full consent record for the doctor: what was agreed, when, by whom, the signature,
+    // the notice exactly as shown, and every earlier decision. Doctors only (staff are not
+    // on the allowed list for this path).
+    app.get("/patients/:id/consent/record", async (req, res) => {
+        try {
+            if (!(await ownedPatient(req, req.params.id)))
+                return res.status(404).json({ error: "Not found" });
+            const { data, error } = await supabase
+                .from("patient_consents")
+                .select(
+                    "status, notice_version, notice_hash, notice_snapshot, signer_type, signer_name, signer_relationship, on_behalf_reason, signature_data, captured_by_role, created_at",
+                )
+                .eq("owner_id", req.userId)
+                .eq("patient_id", req.params.id)
+                .order("created_at", { ascending: false })
+                .limit(30);
+            if (error) throw error;
+            const rows = data || [];
+            const granted = rows.find((r) => r.status === "granted");
+            res.json({
+                status: stateOf(rows[0]),
+                current_notice_version: NOTICE.version,
+                // The most recent agreement, in full
+                granted: granted
+                    ? {
+                          at: granted.created_at,
+                          notice_version: granted.notice_version,
+                          outdated: granted.notice_hash !== NOTICE_HASH,
+                          signer_type: granted.signer_type,
+                          signer_name: granted.signer_name,
+                          signer_relationship: granted.signer_relationship,
+                          on_behalf_reason: granted.on_behalf_reason,
+                          captured_by_role: granted.captured_by_role,
+                          signature_data: granted.signature_data,
+                          notice: granted.notice_snapshot,
+                      }
+                    : null,
+                // Every decision, newest first, without the large fields
+                history: rows.map((r) => ({
+                    decision: r.status,
+                    at: r.created_at,
+                    notice_version: r.notice_version,
+                    signer_name: r.signer_name,
+                    signer_type: r.signer_type,
+                    captured_by_role: r.captured_by_role,
+                })),
+            });
+        } catch (err) {
+            console.log("⚠️ Consent record fetch failed:", err.message);
+            res.status(500).json({
+                error: "Failed to load the consent record",
+            });
+        }
+    });
+
     async function insertRow(req, res, patient, fields) {
         const { error } = await supabase.from("patient_consents").insert({
             patient_id: patient.id,

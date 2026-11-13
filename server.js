@@ -991,7 +991,9 @@ function patientContext(p) {
     const age = ageFromDob(p.dob) ?? p.age;
     if (age != null) lines.push(`Age: ${age}`);
     if (p.gender) lines.push(`Gender: ${p.gender}`);
+    if (p.marital_status) lines.push(`Marital status: ${p.marital_status}`);
     if (p.occupation) lines.push(`Occupation: ${p.occupation}`);
+    if (p.city) lines.push(`Lives in: ${p.city}`); // for diseases common in the area
     const m = p.medical && typeof p.medical === "object" ? p.medical : {};
     if (m.blood_group) lines.push(`Blood group: ${m.blood_group}`);
     if (m.no_known_history)
