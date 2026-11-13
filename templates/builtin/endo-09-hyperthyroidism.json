@@ -1,0 +1,90 @@
+{
+    "id": "00000000-0000-4000-8000-000000000009",
+    "name": "Hyperthyroidism",
+    "specialty": "Endocrinology",
+    "kind": "condition",
+    "description": "Hyperthyroidism / Graves visit: symptoms, tests, antithyroid dose and eye signs.",
+    "sections": [
+        {
+            "id": "complaints",
+            "type": "complaints"
+        },
+        {
+            "id": "vitals",
+            "type": "vitals"
+        },
+        {
+            "id": "hyper_tests",
+            "type": "values",
+            "title": "Thyroid tests",
+            "fields": [
+                {
+                    "key": "tsh",
+                    "label": "TSH",
+                    "unit": "mIU/L"
+                },
+                {
+                    "key": "ft4",
+                    "label": "Free T4",
+                    "unit": "ng/dL"
+                },
+                {
+                    "key": "ft3",
+                    "label": "Free T3",
+                    "unit": "pg/mL"
+                },
+                {
+                    "key": "trab",
+                    "label": "TRAb",
+                    "unit": "IU/L"
+                }
+            ]
+        },
+        {
+            "id": "hyper_signs",
+            "type": "checklist",
+            "title": "Clinical signs",
+            "items": [
+                "Tremor",
+                "Goitre",
+                "Eye signs (proptosis, lid lag)",
+                "Tachycardia / AF",
+                "Weight loss"
+            ]
+        },
+        {
+            "id": "cbc_lft",
+            "type": "values",
+            "title": "Safety tests",
+            "fields": [
+                {
+                    "key": "tlc",
+                    "label": "Total WBC count",
+                    "unit": "/µL"
+                },
+                {
+                    "key": "anc",
+                    "label": "Neutrophil count",
+                    "unit": "/µL"
+                },
+                {
+                    "key": "alt",
+                    "label": "ALT",
+                    "unit": "U/L"
+                }
+            ]
+        },
+        {
+            "id": "diagnosis",
+            "type": "diagnosis"
+        },
+        {
+            "id": "prescription",
+            "type": "prescription"
+        },
+        {
+            "id": "followup",
+            "type": "followup"
+        }
+    ]
+}

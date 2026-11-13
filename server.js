@@ -89,6 +89,12 @@ const staffCache = new Map(); // staffUserId -> { doctorId | null, at }
 const STAFF_TTL = 60 * 1000;
 const createBrands = require("./brands");
 const llm = require("./llm");
+const { prepareExtraction } = require("./templates/prepare");
+const { normalizeExtraction } = require("./templates/normalize");
+const { voiceSpecFor, limitRowsToTemplate } = require("./templates/voice");
+const general = require("./templates/general");
+const templateRoutes = require("./templates/routes");
+const templateStore = require("./templates/store");
 const brands = createBrands({ supabase, llmJson });
 async function lookupDoctorForStaff(userId) {
     const hit = staffCache.get(userId);
@@ -876,7 +882,14 @@ function summarizeSectionForPrompt(sd) {
 }
 
 async function regenerateConsultationSummary(structuredData) {
-    const record = summarizeSectionForPrompt(structuredData);
+    const record = [
+        summarizeSectionForPrompt(structuredData),
+        await templateRoutes
+            .customContext(supabase, structuredData)
+            .catch(() => ""),
+    ]
+        .filter(Boolean)
+        .join("\n");
     if (!record.trim())
         return (
             structuredData.consultation_summary || { overview: "", details: [] }
@@ -941,6 +954,7 @@ function parseModelJson(text) {
 
 const EXPECTED_KEYS = [
     "consultation_summary",
+    "custom",
     "prescription",
     "conditions",
     "vitals",
@@ -1116,7 +1130,14 @@ function cleanSuggestion(obj) {
 async function generateSuggestion({ transcript, patient, sd }) {
     try {
         const hasTalk = !!transcript && transcript.length >= 40;
-        const record = suggestionContext(sd || {});
+        const record = [
+            suggestionContext(sd || {}),
+            await templateRoutes
+                .customContext(supabase, sd)
+                .catch(() => ""),
+        ]
+            .filter(Boolean)
+            .join("\n");
         // Reports only: no recording, so the plan is built from what the reports showed
         if (!hasTalk && record.length < 40) return null;
         const ctx = [patientContext(patient), record]
@@ -1260,17 +1281,15 @@ app.post(
                 return fail("transcribe");
             lap("transcribe");
 
-            // ---- 2. Build the prompt ----
-            const template = fs.readFileSync("template.json", "utf-8");
-            let prompt = fs
-                .readFileSync("prompt.md", "utf-8")
-                .replace("{{template}}", () => template)
-                .replace("{{transcript}}", () => transcript);
-
-            const regContext = patientContext(patient);
-            if (regContext) {
-                prompt += `\n\n# Patient registration record (context only)\nThis is background from registration. Use it to understand the visit. Do NOT copy any of it into the output unless the transcript itself mentions it.\n${regContext}\n`;
-            }
+            // ---- 2. Build the prompt from the chosen template ----
+            const chosen = await prepareExtraction({
+                supabase,
+                ownerId: req.userId,
+                templateId: String(req.body?.template_id || "") || undefined,
+                transcript,
+                regContext: patientContext(patient),
+            });
+            const prompt = chosen.prompt;
             let attachmentImages = [];
             for (const file of attachmentFiles) {
                 try {
@@ -1301,9 +1320,12 @@ app.post(
                 return fail("summarize");
             }
             lap("extract");
+            // Only the template's sections, each present and the right kind
+            structuredData = normalizeExtraction(chosen.definition, structuredData);
             // ---- 4. Codes and the plan come after saving (see finishInBackground) ----
             stripRxnorm(structuredData);
             blankCodes(structuredData);
+            structuredData.template = chosen.template;
             const extracted = JSON.parse(JSON.stringify(structuredData));
             const now = new Date().toISOString();
             structuredData.codes_pending_since = now;
@@ -2108,12 +2130,27 @@ app.get("/me", async (req, res) => {
 app.put("/doctor/settings", async (req, res) => {
     try {
         const b = req.body || {};
-        if (typeof b.show_codes !== "boolean")
+        const update = {};
+        if (typeof b.show_codes === "boolean") update.show_codes = b.show_codes;
+        if ("default_template_id" in b) {
+            const tid = b.default_template_id;
+            if (tid !== null && typeof tid !== "string")
+                return res.status(400).json({ error: "Invalid template" });
+            try {
+                // checks the template is built-in or the doctor's own
+                await templateStore.setDefaultTemplate(supabase, req.userId, tid);
+            } catch (err) {
+                if (err.message === "Template not found")
+                    return res.status(404).json({ error: "Template not found" });
+                throw err;
+            }
+        }
+        if (!Object.keys(update).length && !("default_template_id" in b))
             return res.status(400).json({ error: "Nothing to save" });
         const { data, error } = await supabase
             .from("doctors")
             .update({
-                show_codes: b.show_codes,
+                ...update,
                 updated_at: new Date().toISOString(),
             })
             .eq("owner_id", req.userId)
@@ -2126,6 +2163,37 @@ app.put("/doctor/settings", async (req, res) => {
     } catch (err) {
         console.log("⚠️ Settings save failed:", err.message);
         res.status(500).json({ error: "Couldn't save the setting" });
+    }
+});
+
+// Templates the doctor can use: built-in ones and their own
+app.get("/templates", async (req, res) => {
+    try {
+        res.json({
+            templates: await templateStore.listTemplates(supabase, req.userId),
+        });
+    } catch (err) {
+        console.log("⚠️ Templates list failed:", err.message);
+        res.status(500).json({ error: "Couldn't load templates" });
+    }
+});
+
+// One exact version of a template (how a saved note is laid out)
+app.get("/templates/:id/versions/:version", async (req, res) => {
+    try {
+        const version = Number(req.params.version);
+        if (!Number.isInteger(version) || version < 1)
+            return res.status(404).json({ error: "Not found" });
+        const t = await templateStore.templateForNote(supabase, req.userId, {
+            id: req.params.id,
+            version,
+        });
+        if (t.id !== req.params.id || t.version !== version)
+            return res.status(404).json({ error: "Not found" });
+        res.json(t);
+    } catch (err) {
+        console.log("⚠️ Template load failed:", err.message);
+        res.status(500).json({ error: "Couldn't load the template" });
     }
 });
 
@@ -4028,7 +4096,9 @@ const countRows = (rows) =>
             n +
             (k === "prescription"
                 ? Object.values(v).reduce((m, a) => m + a.length, 0)
-                : v.length),
+                : k === "custom"
+                  ? Object.keys(v || {}).length
+                  : v.length),
         0,
     );
 // ---- values the doctor can change by voice ----
@@ -4373,7 +4443,8 @@ async function parseVoice(spec, heard, record = "(none)") {
                 { json: attempt > 0, timeout: 60000 },
             );
             const obj = parseModelJson(text);
-            if (obj) return { rows: spec.clean(obj), edits: obj.edits };
+            if (obj)
+                return { rows: spec.clean(obj), edits: obj.edits, custom: obj.custom };
         } catch (err) {
             console.log(
                 `⚠️ Voice parse attempt ${attempt + 1} failed:`,
@@ -4567,6 +4638,8 @@ app.post(
             // The record so far, so a spoken correction can point at a saved row
             let sd = {};
             let index = [];
+            let useSpec = spec;
+            let noteDef = null;
             const cid = String(req.body?.consultation_id || "");
             if (spec === VOICE_SECTIONS.all && cid) {
                 const c = await loadConsultationFull(cid, req.userId).catch(
@@ -4575,16 +4648,30 @@ app.post(
                 if (c) {
                     sd = sdOf(c);
                     index = buildEditIndex(sd);
+                    // Only the sections this note's template has
+                    const t = await templateStore
+                        .templateForNote(supabase, req.userId, sd.template)
+                        .catch(() => null);
+                    if (t) {
+                        noteDef = t.definition;
+                        useSpec = { ...spec, ...voiceSpecFor(t.definition) };
+                    }
                 }
             }
 
-            const parsed = await parseVoice(spec, heard, editIndexText(index));
+            const parsed = await parseVoice(useSpec, heard, editIndexText(index));
             if (!parsed) {
                 return res.status(502).json({
                     error: "Couldn't understand the recording. Please try again.",
                 });
             }
-            const rows = parsed.rows;
+            // Same guard as apply: nothing for sections this note's template doesn't have
+            const rows = noteDef
+                ? limitRowsToTemplate(noteDef, {
+                      ...parsed.rows,
+                      custom: parsed.custom,
+                  })
+                : parsed.rows;
             try {
                 await recoverSpokenBrands(
                     rows.prescription?.medications,
@@ -4648,8 +4735,17 @@ app.post(
             const c = await loadConsultationFull(req.params.id, req.userId);
             if (!c) return res.status(404).json({ error: "Not found" });
 
-            const rows = VOICE_SECTIONS.all.clean(req.body?.rows); // never trust the browser's shape
             const sd = sdOf(c);
+            const noteTemplate = await templateStore.templateForNote(
+                supabase,
+                req.userId,
+                sd.template,
+            );
+            // never trust the browser's shape, and never add a section the template lacks
+            const rows = limitRowsToTemplate(noteTemplate.definition, {
+                ...VOICE_SECTIONS.all.clean(req.body?.rows),
+                custom: req.body?.rows?.custom,
+            });
 
             // Every change is checked against the record as it is now, and against the value the doctor saw
             const index = buildEditIndex(sd);
@@ -4808,6 +4904,23 @@ app.post(
             }
             if (Object.keys(cleaned).length)
                 patch.prescription = next.prescription = { ...rx, ...cleaned };
+
+            // The template's own sections: values replace, lists add, checklists update by item
+            const customIn = rows.custom || {};
+            if (Object.keys(customIn).length) {
+                const curCustom =
+                    sd.custom && typeof sd.custom === "object" ? sd.custom : {};
+                const merged = { ...curCustom };
+                for (const s of noteTemplate.definition.sections || []) {
+                    if (customIn[s.id] === undefined) continue;
+                    merged[s.id] = general.mergeGeneral(
+                        s,
+                        curCustom[s.id],
+                        customIn[s.id],
+                    );
+                }
+                patch.custom = next.custom = merged;
+            }
 
             const { error: saveErr } = await supabase
                 .from("consultations")
@@ -5141,6 +5254,20 @@ app.put("/brand-prefs/favourite", async (req, res) => {
         res.status(400).json({ error: "Couldn't save" });
     }
 });
+templateRoutes.register(app, {
+    supabase,
+    llm,
+    consentGateByConsultation,
+    parseModelJson,
+    loadConsultationFull,
+    extractStructured,
+    stripRxnorm,
+    blankCodes,
+    patientContext,
+    finishInBackground,
+    regeneratePatientSummary,
+});
+
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);

@@ -1,0 +1,78 @@
+{
+    "id": "00000000-0000-4000-8000-000000000006",
+    "name": "Diabetic Foot Assessment",
+    "specialty": "Endocrinology",
+    "kind": "condition",
+    "description": "Foot examination for people with diabetes: sensation, pulses, skin, risk and plan.",
+    "sections": [
+        {
+            "id": "complaints",
+            "type": "complaints"
+        },
+        {
+            "id": "foot_exam",
+            "type": "checklist",
+            "title": "Foot examination",
+            "items": [
+                "Monofilament sensation reduced",
+                "Vibration sense reduced",
+                "Dorsalis pedis pulse absent",
+                "Posterior tibial pulse absent",
+                "Callus",
+                "Ulcer",
+                "Deformity (claw toe, Charcot)",
+                "Fungal infection",
+                "Poor footwear"
+            ],
+            "instructions": "Note left or right side in the note."
+        },
+        {
+            "id": "ulcer_details",
+            "type": "text",
+            "title": "Ulcer details",
+            "instructions": "Site, size, depth, infection signs, if an ulcer is present."
+        },
+        {
+            "id": "foot_risk",
+            "type": "choice",
+            "title": "Foot risk category",
+            "options": [
+                "Low",
+                "Moderate",
+                "High",
+                "Active ulcer"
+            ],
+            "multiple": false
+        },
+        {
+            "id": "investigations",
+            "type": "investigations"
+        },
+        {
+            "id": "diagnosis",
+            "type": "diagnosis"
+        },
+        {
+            "id": "prescription",
+            "type": "prescription"
+        },
+        {
+            "id": "education",
+            "type": "checklist",
+            "title": "Counselling given",
+            "items": [
+                "Diet",
+                "Exercise",
+                "Hypoglycaemia recognition",
+                "Insulin technique",
+                "Foot care",
+                "Sick-day rules"
+            ],
+            "instructions": "Mark yes for topics the doctor counselled on."
+        },
+        {
+            "id": "followup",
+            "type": "followup"
+        }
+    ]
+}

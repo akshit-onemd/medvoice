@@ -1,0 +1,20 @@
+{
+  "vitals": [{ "name": "", "value": "" }],
+  "allergies": [{ "name": "", "notes": "" }],
+  "conditions": [{ "name": "", "duration": "", "notes": "" }],
+  "medication_history": [{ "name": "", "brand": "", "dosage": "", "duration": "", "status": "", "instruction": [] }],
+  "investigation_history": [{ "name": "", "date": "", "readings": [{ "investigation_name": "", "result": "", "unit": "", "interpretation": "", "notes": "" }] }],
+  "procedures": [{ "name": "", "date": "", "notes": "" }],
+  "system_review": [{ "name": "", "findings": [], "notes": "" }],
+  "family_history": [{ "relationship": "", "illness": [], "notes": "" }],
+  "lifestyle_habits": [{ "name": "", "frequency": "", "duration": "", "notes": "" }],
+  "social_history": [{ "name": "", "notes": "" }],
+  "other_history": [{ "name": "", "notes": "" }],
+  "prescription": {
+    "symptoms": [{ "name": "", "duration": "", "notes": "" }],
+    "medications": [{ "name": "", "brand": "", "duration": "", "dosage": [], "instructions": "" }],
+    "diagnosis": [{ "name": "" }],
+    "followup": [{ "next_visit_duration": "", "date": "", "advice": "" }]
+  },
+      "edits": [{ "id": "", "field": "", "value": "" }]
+}

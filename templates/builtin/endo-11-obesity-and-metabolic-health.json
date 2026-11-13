@@ -1,0 +1,160 @@
+{
+    "id": "00000000-0000-4000-8000-000000000011",
+    "name": "Obesity & Metabolic Health",
+    "specialty": "Endocrinology",
+    "kind": "condition",
+    "description": "Weight management: measurements, diet and activity, metabolic tests, medicines.",
+    "sections": [
+        {
+            "id": "complaints",
+            "type": "complaints"
+        },
+        {
+            "id": "vitals",
+            "type": "vitals"
+        },
+        {
+            "id": "anthropometry",
+            "type": "values",
+            "title": "Body measurements",
+            "fields": [
+                {
+                    "key": "bmi",
+                    "label": "BMI",
+                    "unit": "kg/m²"
+                },
+                {
+                    "key": "waist",
+                    "label": "Waist circumference",
+                    "unit": "cm"
+                },
+                {
+                    "key": "pulse",
+                    "label": "Pulse",
+                    "unit": "/min"
+                },
+                {
+                    "key": "spo2",
+                    "label": "SpO2",
+                    "unit": "%"
+                }
+            ]
+        },
+        {
+            "id": "body_comp",
+            "type": "values",
+            "title": "Weight goals",
+            "fields": [
+                {
+                    "key": "target",
+                    "label": "Target weight",
+                    "unit": "kg"
+                },
+                {
+                    "key": "change",
+                    "label": "Change since last visit",
+                    "unit": "kg"
+                }
+            ]
+        },
+        {
+            "id": "lifestyle",
+            "type": "lifestyle",
+            "title": "Diet, activity & sleep"
+        },
+        {
+            "id": "glycaemic",
+            "type": "values",
+            "title": "Glycaemic profile",
+            "fields": [
+                {
+                    "key": "hba1c",
+                    "label": "HbA1c",
+                    "unit": "%",
+                    "range": "< 7"
+                },
+                {
+                    "key": "fbs",
+                    "label": "Fasting glucose",
+                    "unit": "mg/dL",
+                    "range": "70–100"
+                },
+                {
+                    "key": "ppbs",
+                    "label": "Post-meal glucose",
+                    "unit": "mg/dL",
+                    "range": "< 140"
+                },
+                {
+                    "key": "rbs",
+                    "label": "Random glucose",
+                    "unit": "mg/dL"
+                }
+            ],
+            "instructions": "Latest values the doctor mentions or reads from reports, with the value only."
+        },
+        {
+            "id": "renal",
+            "type": "values",
+            "title": "Kidney & lipids",
+            "fields": [
+                {
+                    "key": "creatinine",
+                    "label": "Creatinine",
+                    "unit": "mg/dL"
+                },
+                {
+                    "key": "egfr",
+                    "label": "eGFR",
+                    "unit": "mL/min/1.73m²"
+                },
+                {
+                    "key": "uacr",
+                    "label": "Urine ACR",
+                    "unit": "mg/g",
+                    "range": "< 30"
+                },
+                {
+                    "key": "ldl",
+                    "label": "LDL",
+                    "unit": "mg/dL"
+                },
+                {
+                    "key": "tg",
+                    "label": "Triglycerides",
+                    "unit": "mg/dL"
+                }
+            ]
+        },
+        {
+            "id": "comorbid",
+            "type": "checklist",
+            "title": "Weight-related conditions",
+            "items": [
+                "Fatty liver",
+                "Sleep apnoea",
+                "Hypertension",
+                "Knee / back pain",
+                "PCOS"
+            ]
+        },
+        {
+            "id": "diagnosis",
+            "type": "diagnosis"
+        },
+        {
+            "id": "prescription",
+            "type": "prescription"
+        },
+        {
+            "id": "plan_notes",
+            "type": "text",
+            "title": "Diet & exercise plan",
+            "instructions": "What was agreed: calories, meals, activity minutes."
+        },
+        {
+            "id": "followup",
+            "type": "followup"
+        }
+    ]
+}

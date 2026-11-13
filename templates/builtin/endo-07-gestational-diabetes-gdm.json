@@ -1,0 +1,151 @@
+{
+    "id": "00000000-0000-4000-8000-000000000007",
+    "name": "Gestational Diabetes (GDM)",
+    "specialty": "Endocrinology",
+    "kind": "condition",
+    "description": "Diabetes in pregnancy: gestation, readings, diet, medicines and foetal follow-up.",
+    "sections": [
+        {
+            "id": "complaints",
+            "type": "complaints"
+        },
+        {
+            "id": "pregnancy",
+            "type": "values",
+            "title": "Pregnancy details",
+            "fields": [
+                {
+                    "key": "ga",
+                    "label": "Gestational age",
+                    "unit": "weeks"
+                },
+                {
+                    "key": "edd",
+                    "label": "EDD"
+                },
+                {
+                    "key": "gravida",
+                    "label": "Gravida / para"
+                }
+            ]
+        },
+        {
+            "id": "vitals",
+            "type": "vitals"
+        },
+        {
+            "id": "smbg",
+            "type": "list",
+            "title": "Home glucose readings",
+            "fields": [
+                {
+                    "key": "when",
+                    "label": "When"
+                },
+                {
+                    "key": "reading",
+                    "label": "Reading (mg/dL)"
+                },
+                {
+                    "key": "notes",
+                    "label": "Notes"
+                }
+            ],
+            "instructions": "Readings from the patient's glucometer or CGM, one row each."
+        },
+        {
+            "id": "ogtt",
+            "type": "values",
+            "title": "OGTT",
+            "fields": [
+                {
+                    "key": "fasting",
+                    "label": "Fasting",
+                    "unit": "mg/dL",
+                    "range": "< 92"
+                },
+                {
+                    "key": "one_hr",
+                    "label": "1 hour",
+                    "unit": "mg/dL",
+                    "range": "< 180"
+                },
+                {
+                    "key": "two_hr",
+                    "label": "2 hour",
+                    "unit": "mg/dL",
+                    "range": "< 153"
+                }
+            ]
+        },
+        {
+            "id": "glycaemic",
+            "type": "values",
+            "title": "Glycaemic profile",
+            "fields": [
+                {
+                    "key": "hba1c",
+                    "label": "HbA1c",
+                    "unit": "%",
+                    "range": "< 7"
+                },
+                {
+                    "key": "fbs",
+                    "label": "Fasting glucose",
+                    "unit": "mg/dL",
+                    "range": "70–100"
+                },
+                {
+                    "key": "ppbs",
+                    "label": "Post-meal glucose",
+                    "unit": "mg/dL",
+                    "range": "< 140"
+                },
+                {
+                    "key": "rbs",
+                    "label": "Random glucose",
+                    "unit": "mg/dL"
+                }
+            ],
+            "instructions": "Latest values the doctor mentions or reads from reports, with the value only."
+        },
+        {
+            "id": "gdm_management",
+            "type": "choice",
+            "title": "Current management",
+            "options": [
+                "Diet only",
+                "Metformin",
+                "Insulin",
+                "Metformin + insulin"
+            ],
+            "multiple": false
+        },
+        {
+            "id": "diagnosis",
+            "type": "diagnosis"
+        },
+        {
+            "id": "prescription",
+            "type": "prescription"
+        },
+        {
+            "id": "education",
+            "type": "checklist",
+            "title": "Counselling given",
+            "items": [
+                "Diet",
+                "Exercise",
+                "Hypoglycaemia recognition",
+                "Insulin technique",
+                "Foot care",
+                "Sick-day rules"
+            ],
+            "instructions": "Mark yes for topics the doctor counselled on."
+        },
+        {
+            "id": "followup",
+            "type": "followup"
+        }
+    ]
+}

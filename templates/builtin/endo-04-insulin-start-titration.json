@@ -1,0 +1,140 @@
+{
+    "id": "00000000-0000-4000-8000-000000000004",
+    "name": "Insulin Start / Titration",
+    "specialty": "Endocrinology",
+    "kind": "condition",
+    "description": "Starting insulin or adjusting doses: readings, current doses, technique and hypos.",
+    "sections": [
+        {
+            "id": "complaints",
+            "type": "complaints",
+            "title": "Current concerns"
+        },
+        {
+            "id": "smbg",
+            "type": "list",
+            "title": "Home glucose readings",
+            "fields": [
+                {
+                    "key": "when",
+                    "label": "When"
+                },
+                {
+                    "key": "reading",
+                    "label": "Reading (mg/dL)"
+                },
+                {
+                    "key": "notes",
+                    "label": "Notes"
+                }
+            ],
+            "instructions": "Readings from the patient's glucometer or CGM, one row each."
+        },
+        {
+            "id": "insulin_doses",
+            "type": "list",
+            "title": "Current insulin doses",
+            "fields": [
+                {
+                    "key": "insulin",
+                    "label": "Insulin"
+                },
+                {
+                    "key": "dose",
+                    "label": "Dose (units)"
+                },
+                {
+                    "key": "timing",
+                    "label": "Timing"
+                }
+            ]
+        },
+        {
+            "id": "hypos",
+            "type": "choice",
+            "title": "Hypoglycaemia since last visit",
+            "options": [
+                "None",
+                "Mild, self-treated",
+                "Needed help from another person",
+                "Hospital visit"
+            ],
+            "multiple": false
+        },
+        {
+            "id": "insulin_technique",
+            "type": "checklist",
+            "title": "Injection technique checked",
+            "items": [
+                "Correct injection site rotation",
+                "Lipohypertrophy",
+                "Pen / syringe technique",
+                "Storage of insulin",
+                "Needle disposal"
+            ]
+        },
+        {
+            "id": "glycaemic",
+            "type": "values",
+            "title": "Glycaemic profile",
+            "fields": [
+                {
+                    "key": "hba1c",
+                    "label": "HbA1c",
+                    "unit": "%",
+                    "range": "< 7"
+                },
+                {
+                    "key": "fbs",
+                    "label": "Fasting glucose",
+                    "unit": "mg/dL",
+                    "range": "70–100"
+                },
+                {
+                    "key": "ppbs",
+                    "label": "Post-meal glucose",
+                    "unit": "mg/dL",
+                    "range": "< 140"
+                },
+                {
+                    "key": "rbs",
+                    "label": "Random glucose",
+                    "unit": "mg/dL"
+                }
+            ],
+            "instructions": "Latest values the doctor mentions or reads from reports, with the value only."
+        },
+        {
+            "id": "diagnosis",
+            "type": "diagnosis"
+        },
+        {
+            "id": "prescription",
+            "type": "prescription"
+        },
+        {
+            "id": "titration_plan",
+            "type": "text",
+            "title": "Titration plan",
+            "instructions": "How the patient should change doses at home, as the doctor said."
+        },
+        {
+            "id": "education",
+            "type": "checklist",
+            "title": "Counselling given",
+            "items": [
+                "Diet",
+                "Exercise",
+                "Hypoglycaemia recognition",
+                "Insulin technique",
+                "Foot care",
+                "Sick-day rules"
+            ],
+            "instructions": "Mark yes for topics the doctor counselled on."
+        },
+        {
+            "id": "followup",
+            "type": "followup"
+        }
+    ]
+}

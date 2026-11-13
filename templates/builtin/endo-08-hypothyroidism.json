@@ -1,0 +1,89 @@
+{
+    "id": "00000000-0000-4000-8000-000000000008",
+    "name": "Hypothyroidism",
+    "specialty": "Endocrinology",
+    "kind": "condition",
+    "description": "Hypothyroidism visit: symptoms, thyroid tests, dose and timing.",
+    "sections": [
+        {
+            "id": "complaints",
+            "type": "complaints"
+        },
+        {
+            "id": "vitals",
+            "type": "vitals"
+        },
+        {
+            "id": "thyroid",
+            "type": "values",
+            "title": "Thyroid tests",
+            "fields": [
+                {
+                    "key": "tsh",
+                    "label": "TSH",
+                    "unit": "mIU/L",
+                    "range": "0.4–4.0"
+                },
+                {
+                    "key": "ft4",
+                    "label": "Free T4",
+                    "unit": "ng/dL"
+                },
+                {
+                    "key": "ft3",
+                    "label": "Free T3",
+                    "unit": "pg/mL"
+                },
+                {
+                    "key": "tpo",
+                    "label": "Anti-TPO",
+                    "unit": "IU/mL"
+                }
+            ]
+        },
+        {
+            "id": "thyroxine",
+            "type": "values",
+            "title": "Thyroxine dose",
+            "fields": [
+                {
+                    "key": "dose",
+                    "label": "Current dose",
+                    "unit": "mcg"
+                },
+                {
+                    "key": "taken",
+                    "label": "How it is taken"
+                }
+            ],
+            "instructions": "Dose and whether taken empty stomach, separate from other medicines."
+        },
+        {
+            "id": "pregnancy_status",
+            "type": "choice",
+            "title": "Pregnancy",
+            "options": [
+                "Not pregnant",
+                "Planning pregnancy",
+                "Pregnant"
+            ],
+            "multiple": false
+        },
+        {
+            "id": "examination",
+            "type": "examination"
+        },
+        {
+            "id": "diagnosis",
+            "type": "diagnosis"
+        },
+        {
+            "id": "prescription",
+            "type": "prescription"
+        },
+        {
+            "id": "followup",
+            "type": "followup"
+        }
+    ]
+}

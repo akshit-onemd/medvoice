@@ -1,0 +1,144 @@
+{
+    "id": "00000000-0000-4000-8000-000000000003",
+    "name": "Diabetes Follow-up",
+    "specialty": "Endocrinology",
+    "kind": "follow_up",
+    "description": "Routine diabetes review: readings, hypos, adherence and medicine changes.",
+    "sections": [
+        {
+            "id": "complaints",
+            "type": "complaints",
+            "title": "Current concerns"
+        },
+        {
+            "id": "vitals",
+            "type": "vitals"
+        },
+        {
+            "id": "anthropometry",
+            "type": "values",
+            "title": "Body measurements",
+            "fields": [
+                {
+                    "key": "bmi",
+                    "label": "BMI",
+                    "unit": "kg/m²"
+                },
+                {
+                    "key": "waist",
+                    "label": "Waist circumference",
+                    "unit": "cm"
+                },
+                {
+                    "key": "pulse",
+                    "label": "Pulse",
+                    "unit": "/min"
+                },
+                {
+                    "key": "spo2",
+                    "label": "SpO2",
+                    "unit": "%"
+                }
+            ]
+        },
+        {
+            "id": "glycaemic",
+            "type": "values",
+            "title": "Glycaemic profile",
+            "fields": [
+                {
+                    "key": "hba1c",
+                    "label": "HbA1c",
+                    "unit": "%",
+                    "range": "< 7"
+                },
+                {
+                    "key": "fbs",
+                    "label": "Fasting glucose",
+                    "unit": "mg/dL",
+                    "range": "70–100"
+                },
+                {
+                    "key": "ppbs",
+                    "label": "Post-meal glucose",
+                    "unit": "mg/dL",
+                    "range": "< 140"
+                },
+                {
+                    "key": "rbs",
+                    "label": "Random glucose",
+                    "unit": "mg/dL"
+                }
+            ],
+            "instructions": "Latest values the doctor mentions or reads from reports, with the value only."
+        },
+        {
+            "id": "smbg",
+            "type": "list",
+            "title": "Home glucose readings",
+            "fields": [
+                {
+                    "key": "when",
+                    "label": "When"
+                },
+                {
+                    "key": "reading",
+                    "label": "Reading (mg/dL)"
+                },
+                {
+                    "key": "notes",
+                    "label": "Notes"
+                }
+            ],
+            "instructions": "Readings from the patient's glucometer or CGM, one row each."
+        },
+        {
+            "id": "hypos",
+            "type": "choice",
+            "title": "Hypoglycaemia since last visit",
+            "options": [
+                "None",
+                "Mild, self-treated",
+                "Needed help from another person",
+                "Hospital visit"
+            ],
+            "multiple": false
+        },
+        {
+            "id": "adherence",
+            "type": "choice",
+            "title": "Medicine adherence",
+            "options": [
+                "Good",
+                "Missing some doses",
+                "Often misses doses",
+                "Stopped on own"
+            ],
+            "multiple": false
+        },
+        {
+            "id": "control",
+            "type": "choice",
+            "title": "Overall control",
+            "options": [
+                "At target",
+                "Improving",
+                "Not at target"
+            ],
+            "multiple": false,
+            "instructions": "Only if the doctor says it."
+        },
+        {
+            "id": "diagnosis",
+            "type": "diagnosis"
+        },
+        {
+            "id": "prescription",
+            "type": "prescription"
+        },
+        {
+            "id": "followup",
+            "type": "followup"
+        }
+    ]
+}

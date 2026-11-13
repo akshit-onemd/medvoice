@@ -1,0 +1,140 @@
+{
+    "id": "00000000-0000-4000-8000-000000000010",
+    "name": "PCOS",
+    "specialty": "Endocrinology",
+    "kind": "condition",
+    "description": "Polycystic ovary syndrome: cycles, hyperandrogenism, metabolic risk and plan.",
+    "sections": [
+        {
+            "id": "complaints",
+            "type": "complaints"
+        },
+        {
+            "id": "menstrual",
+            "type": "values",
+            "title": "Menstrual history",
+            "fields": [
+                {
+                    "key": "lmp",
+                    "label": "LMP"
+                },
+                {
+                    "key": "cycle",
+                    "label": "Cycle length",
+                    "unit": "days"
+                },
+                {
+                    "key": "flow",
+                    "label": "Flow"
+                }
+            ]
+        },
+        {
+            "id": "vitals",
+            "type": "vitals"
+        },
+        {
+            "id": "anthropometry",
+            "type": "values",
+            "title": "Body measurements",
+            "fields": [
+                {
+                    "key": "bmi",
+                    "label": "BMI",
+                    "unit": "kg/m²"
+                },
+                {
+                    "key": "waist",
+                    "label": "Waist circumference",
+                    "unit": "cm"
+                },
+                {
+                    "key": "pulse",
+                    "label": "Pulse",
+                    "unit": "/min"
+                },
+                {
+                    "key": "spo2",
+                    "label": "SpO2",
+                    "unit": "%"
+                }
+            ]
+        },
+        {
+            "id": "hyperandrogenism",
+            "type": "checklist",
+            "title": "Hyperandrogenism",
+            "items": [
+                "Hirsutism",
+                "Acne",
+                "Hair thinning",
+                "Acanthosis nigricans"
+            ]
+        },
+        {
+            "id": "pcos_labs",
+            "type": "values",
+            "title": "Tests",
+            "fields": [
+                {
+                    "key": "lh",
+                    "label": "LH",
+                    "unit": "mIU/mL"
+                },
+                {
+                    "key": "fsh",
+                    "label": "FSH",
+                    "unit": "mIU/mL"
+                },
+                {
+                    "key": "testosterone",
+                    "label": "Total testosterone",
+                    "unit": "ng/dL"
+                },
+                {
+                    "key": "amh",
+                    "label": "AMH",
+                    "unit": "ng/mL"
+                },
+                {
+                    "key": "tsh",
+                    "label": "TSH",
+                    "unit": "mIU/L"
+                },
+                {
+                    "key": "prolactin",
+                    "label": "Prolactin",
+                    "unit": "ng/mL"
+                }
+            ]
+        },
+        {
+            "id": "fertility_goal",
+            "type": "choice",
+            "title": "Fertility plans",
+            "options": [
+                "Not trying",
+                "Trying to conceive",
+                "Wants contraception"
+            ],
+            "multiple": false
+        },
+        {
+            "id": "investigations",
+            "type": "investigations",
+            "title": "Ultrasound & other reports"
+        },
+        {
+            "id": "diagnosis",
+            "type": "diagnosis"
+        },
+        {
+            "id": "prescription",
+            "type": "prescription"
+        },
+        {
+            "id": "followup",
+            "type": "followup"
+        }
+    ]
+}

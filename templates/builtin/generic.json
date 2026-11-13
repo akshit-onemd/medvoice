@@ -1,0 +1,68 @@
+{
+    "id": "00000000-0000-4000-8000-000000000001",
+    "name": "General OPD",
+    "specialty": "General Medicine",
+    "kind": "new",
+    "sections": [
+        {
+            "id": "diagnosis",
+            "type": "diagnosis"
+        },
+        {
+            "id": "complaints",
+            "type": "complaints"
+        },
+        {
+            "id": "prescription",
+            "type": "prescription"
+        },
+        {
+            "id": "followup",
+            "type": "followup"
+        },
+        {
+            "id": "vitals",
+            "type": "vitals"
+        },
+        {
+            "id": "allergies",
+            "type": "allergies"
+        },
+        {
+            "id": "conditions",
+            "type": "conditions"
+        },
+        {
+            "id": "medication_history",
+            "type": "medication_history"
+        },
+        {
+            "id": "investigations",
+            "type": "investigations"
+        },
+        {
+            "id": "procedures",
+            "type": "procedures"
+        },
+        {
+            "id": "examination",
+            "type": "examination"
+        },
+        {
+            "id": "family_history",
+            "type": "family_history"
+        },
+        {
+            "id": "lifestyle",
+            "type": "lifestyle"
+        },
+        {
+            "id": "social_history",
+            "type": "social_history"
+        },
+        {
+            "id": "other_history",
+            "type": "other_history"
+        }
+    ]
+}

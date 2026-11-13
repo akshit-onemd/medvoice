@@ -1,0 +1,166 @@
+{
+    "id": "00000000-0000-4000-8000-000000000005",
+    "name": "Annual Diabetes Review",
+    "specialty": "Endocrinology",
+    "kind": "condition",
+    "description": "Yearly diabetes check: full complications screen, labs and targets.",
+    "sections": [
+        {
+            "id": "complaints",
+            "type": "complaints",
+            "title": "Current concerns"
+        },
+        {
+            "id": "vitals",
+            "type": "vitals"
+        },
+        {
+            "id": "anthropometry",
+            "type": "values",
+            "title": "Body measurements",
+            "fields": [
+                {
+                    "key": "bmi",
+                    "label": "BMI",
+                    "unit": "kg/m²"
+                },
+                {
+                    "key": "waist",
+                    "label": "Waist circumference",
+                    "unit": "cm"
+                },
+                {
+                    "key": "pulse",
+                    "label": "Pulse",
+                    "unit": "/min"
+                },
+                {
+                    "key": "spo2",
+                    "label": "SpO2",
+                    "unit": "%"
+                }
+            ]
+        },
+        {
+            "id": "glycaemic",
+            "type": "values",
+            "title": "Glycaemic profile",
+            "fields": [
+                {
+                    "key": "hba1c",
+                    "label": "HbA1c",
+                    "unit": "%",
+                    "range": "< 7"
+                },
+                {
+                    "key": "fbs",
+                    "label": "Fasting glucose",
+                    "unit": "mg/dL",
+                    "range": "70–100"
+                },
+                {
+                    "key": "ppbs",
+                    "label": "Post-meal glucose",
+                    "unit": "mg/dL",
+                    "range": "< 140"
+                },
+                {
+                    "key": "rbs",
+                    "label": "Random glucose",
+                    "unit": "mg/dL"
+                }
+            ],
+            "instructions": "Latest values the doctor mentions or reads from reports, with the value only."
+        },
+        {
+            "id": "renal",
+            "type": "values",
+            "title": "Kidney & lipids",
+            "fields": [
+                {
+                    "key": "creatinine",
+                    "label": "Creatinine",
+                    "unit": "mg/dL"
+                },
+                {
+                    "key": "egfr",
+                    "label": "eGFR",
+                    "unit": "mL/min/1.73m²"
+                },
+                {
+                    "key": "uacr",
+                    "label": "Urine ACR",
+                    "unit": "mg/g",
+                    "range": "< 30"
+                },
+                {
+                    "key": "ldl",
+                    "label": "LDL",
+                    "unit": "mg/dL"
+                },
+                {
+                    "key": "tg",
+                    "label": "Triglycerides",
+                    "unit": "mg/dL"
+                }
+            ]
+        },
+        {
+            "id": "complications",
+            "type": "checklist",
+            "title": "Complication screening",
+            "items": [
+                "Retinopathy (eye exam)",
+                "Nephropathy (urine ACR / eGFR)",
+                "Peripheral neuropathy",
+                "Foot ulcer or deformity",
+                "Peripheral vascular disease",
+                "Coronary artery disease",
+                "Erectile dysfunction"
+            ],
+            "instructions": "Mark yes if present, no if screened and absent, not examined if not checked."
+        },
+        {
+            "id": "vaccines",
+            "type": "checklist",
+            "title": "Vaccinations",
+            "items": [
+                "Influenza",
+                "Pneumococcal",
+                "Hepatitis B"
+            ]
+        },
+        {
+            "id": "examination",
+            "type": "examination"
+        },
+        {
+            "id": "medication_history",
+            "type": "medication_history"
+        },
+        {
+            "id": "control",
+            "type": "choice",
+            "title": "Overall control",
+            "options": [
+                "At target",
+                "Improving",
+                "Not at target"
+            ],
+            "multiple": false,
+            "instructions": "Only if the doctor says it."
+        },
+        {
+            "id": "diagnosis",
+            "type": "diagnosis"
+        },
+        {
+            "id": "prescription",
+            "type": "prescription"
+        },
+        {
+            "id": "followup",
+            "type": "followup"
+        }
+    ]
+}
