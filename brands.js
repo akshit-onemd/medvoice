@@ -418,14 +418,16 @@ ${list.map((c, i) => `${i + 1}. ${c.brand} (${c.manufacturer || "unknown maker"}
     }
 
     // Brand families for one ingredient. Pharmacy-chain labels are left out.
-    async function families(ing) {
+    // brand: what the doctor searched for (e.g. "janumet"); its family comes first so it can be picked
+    async function families(ing, brand = "") {
         if (!ingOk(ing)) return { ing_key: ing, label: ing, families: [] };
         const { data, error } = await supabase
             .from(BRANDS_TABLE)
             .select("brand, manufacturer, comp_key, composition, prominence")
             .eq("ing_key", ing)
             .eq("discontinued", false)
-            .order("prominence", { ascending: false })
+            // Postgres puts empty prominence first when sorting high to low; known brands must come first
+            .order("prominence", { ascending: false, nullsFirst: false })
             .limit(1000);
         if (error) throw error;
         const map = new Map();
@@ -448,10 +450,16 @@ ${list.map((c, i) => `${i + 1}. ${c.brand} (${c.manufacturer || "unknown maker"}
             .select("label")
             .eq("ing_key", ing)
             .maybeSingle();
+        let list = [...map.values()];
+        const want = familyOf(String(brand || "").slice(0, 60));
+        if (want) {
+            const hit = (f) => f.family === want || f.family.startsWith(`${want} `) || f.family.startsWith(want);
+            list = [...list.filter(hit), ...list.filter((f) => !hit(f))];
+        }
         return {
             ing_key: ing,
             label: lab?.label || ing,
-            families: [...map.values()].slice(0, 60).map((f) => ({
+            families: list.slice(0, 300).map((f) => ({
                 ...f,
                 strengths: [...f.strengths].slice(0, 6),
             })),

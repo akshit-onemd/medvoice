@@ -21,7 +21,19 @@ async function templateRow(supabase, id) {
     return data;
 }
 
+// A saved version never changes, so each one is read from the database once per server process
+const versionCache = new WeakMap(); // supabase client -> Map("id:version" -> definition)
+function cacheFor(supabase) {
+    let m = versionCache.get(supabase);
+    if (!m) versionCache.set(supabase, (m = new Map()));
+    return m;
+}
+
 async function versionOf(supabase, row, version) {
+    const cache = cacheFor(supabase);
+    const key = `${row.id}:${version}`;
+    if (cache.has(key))
+        return { id: row.id, version, name: row.name, definition: cache.get(key) };
     const { data, error } = await supabase
         .from("template_versions")
         .select("definition")
@@ -29,7 +41,10 @@ async function versionOf(supabase, row, version) {
         .eq("version", version)
         .maybeSingle();
     if (error) throw error;
-    return data ? { id: row.id, version, name: row.name, definition: data.definition } : null;
+    if (!data) return null;
+    if (cache.size > 500) cache.clear();
+    cache.set(key, data.definition);
+    return { id: row.id, version, name: row.name, definition: data.definition };
 }
 
 async function defaultIdOf(supabase, ownerId) {
@@ -61,14 +76,17 @@ const safely = (fn, label) =>
 
 // The template to use for a new visit: requested, else the doctor's default, else generic
 async function resolveTemplateRaw(supabase, ownerId, templateId) {
-    for (const id of [templateId, await defaultIdOf(supabase, ownerId)]) {
+    // The chosen template first; the doctor's default is only looked up when needed
+    const tryId = async (id) => {
         const row = await templateRow(supabase, id);
-        if (usable(row, ownerId) && !row.archived) {
-            const t = await versionOf(supabase, row, row.current_version);
-            if (t) return t;
-        }
-    }
-    return genericTemplate(supabase);
+        if (!usable(row, ownerId) || row.archived) return null;
+        return versionOf(supabase, row, row.current_version);
+    };
+    return (
+        (templateId && (await tryId(templateId))) ||
+        (await tryId(await defaultIdOf(supabase, ownerId))) ||
+        genericTemplate(supabase)
+    );
 }
 
 // The exact template version a saved note was made with (generic for older notes)
@@ -87,16 +105,17 @@ const templateForNote = safely(templateForNoteRaw, "Note template lookup");
 async function listTemplates(supabase, ownerId) {
     // Two plain queries rather than one or() filter, so the owner id is never put into a filter string
     const cols = "id, owner_id, name, specialty, kind, archived";
-    const [builtins, own] = await Promise.all([
+    // All three at once: one round trip instead of two
+    const [builtins, own, def] = await Promise.all([
         supabase.from("templates").select(cols).is("owner_id", null),
         supabase.from("templates").select(cols).eq("owner_id", ownerId),
+        defaultIdOf(supabase, ownerId),
     ]);
     if (builtins.error) throw builtins.error;
     if (own.error) throw own.error;
     const rows = [...(builtins.data || []), ...(own.data || [])].filter(
         (r) => usable(r, ownerId) && !r.archived,
     );
-    const def = await defaultIdOf(supabase, ownerId);
     const effective = rows.some((r) => r.id === def) ? def : GENERIC_ID;
     return rows
         .map((r) => ({

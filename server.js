@@ -5212,7 +5212,12 @@ app.get("/brands/products", async (req, res) => {
 
 app.get("/brands/families", async (req, res) => {
     try {
-        res.json(await brands.families(String(req.query.ing || "")));
+        res.json(
+            await brands.families(
+                String(req.query.ing || ""),
+                String(req.query.brand || ""),
+            ),
+        );
     } catch (err) {
         res.status(500).json({ error: "Couldn't load brands" });
     }
