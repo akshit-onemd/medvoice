@@ -1422,7 +1422,10 @@ app.get("/patients/:id/consultations", async (req, res) => {
     try {
         const { data, error } = await supabase
             .from("consultations")
-            .select("id, created_at, language, structured_data")
+            // Only the one field the list shows, not every visit's full note
+            .select(
+                "id, created_at, language, summary:structured_data->conditions->0->>name",
+            )
             .eq("patient_id", id)
             .eq("owner_id", req.userId)
             .order("created_at", { ascending: false });
@@ -1432,8 +1435,7 @@ app.get("/patients/:id/consultations", async (req, res) => {
             id: c.id,
             created_at: c.created_at,
             language: c.language,
-            // best-effort one-line summary for the list — adjust fields to match your template.json shape
-            summary: c.structured_data?.conditions?.[0]?.name || null,
+            summary: c.summary || null,
         }));
 
         res.json({ consultations });
